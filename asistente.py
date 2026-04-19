@@ -92,6 +92,7 @@ class ConfigAsistente:
     NOTION_OUTPUT_PAGE_ID = os.environ.get("NOTION_OUTPUT_PAGE_ID")
     NOTION_VERSION = os.environ.get("NOTION_VERSION", "2025-09-03")
     TASK_HUB_URL = os.environ.get("TASK_HUB_URL", "https://www.notion.so/")
+    DIAGNOSTIC_MODE = os.environ.get("DIAGNOSTIC_MODE", "true").lower() == "true"
 
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
@@ -290,6 +291,7 @@ class GoogleCalendarIntegration:
                 scopes=["https://www.googleapis.com/auth/calendar.readonly"],
             )
             self.service = build("calendar", "v3", credentials=self.credentials)
+            self.last_calendar_snapshot: List[Dict] = []
             logger.info("Google Calendar autenticado")
         except Exception as exc:
             logger.error("Error autenticando Google Calendar: %s", exc)
@@ -345,6 +347,10 @@ class GoogleCalendarIntegration:
 
         return calendars
 
+    def get_calendar_snapshot(self) -> List[Dict]:
+        """Devuelve el ultimo snapshot de calendarios clasificados."""
+        return self.last_calendar_snapshot
+
     def get_events_horizon(self, calendar_ids: List[str], hours: int = 48) -> List[Dict]:
         """Obtiene todos los eventos del horizonte solicitado para uno o varios calendarios."""
         try:
@@ -352,6 +358,15 @@ class GoogleCalendarIntegration:
             end_time = now + timedelta(hours=hours)
             events = []
             available_calendars = {item["id"]: item for item in self.get_available_calendars()}
+            self.last_calendar_snapshot = []
+            for item in available_calendars.values():
+                enriched = {
+                    "id": item.get("id"),
+                    "summary": item.get("summary", item.get("id")),
+                    "primary": item.get("primary", False),
+                    **CalendarSourceIntelligence.classify_calendar(item),
+                }
+                self.last_calendar_snapshot.append(enriched)
 
             if calendar_ids == ["ALL"]:
                 selected_calendar_ids = list(available_calendars.keys())
@@ -504,68 +519,14 @@ class NotionIntegration:
         return None, None
 
     def _build_query_payload(self, properties: Dict) -> Dict:
-        """Construye un payload de query compatible con el esquema real."""
-        today = datetime.now().date().isoformat()
-
-        status_name, status_prop = self._find_property(
-            properties,
-            ["status", "select", "checkbox"],
-            ["Status", "Estado", "Situacion"],
-        )
-        due_name, due_prop = self._find_property(
+        """Construye un payload amplio; el filtrado fino se hace localmente para diagnostico."""
+        due_name, _ = self._find_property(
             properties,
             ["date"],
             ["Due Date", "Fecha", "Fecha limite", "Vencimiento", "Deadline"],
         )
 
-        filters = []
-
-        if status_name and status_prop:
-            status_type = status_prop.get("type")
-            if status_type == "checkbox":
-                filters.append({"property": status_name, "checkbox": {"equals": False}})
-            elif status_type in {"status", "select"}:
-                options = status_prop.get(status_type, {}).get("options", [])
-                completed_aliases = {
-                    "completado",
-                    "completed",
-                    "done",
-                    "hecho",
-                    "listo",
-                    "finalizado",
-                }
-                completed_value = next(
-                    (
-                        option["name"]
-                        for option in options
-                        if self._normalize_label(option["name"]) in completed_aliases
-                    ),
-                    None,
-                )
-                if completed_value:
-                    filters.append(
-                        {
-                            "property": status_name,
-                            status_type: {"does_not_equal": completed_value},
-                        }
-                    )
-
-        if due_name and due_prop:
-            filters.append(
-                {
-                    "or": [
-                        {"property": due_name, "date": {"equals": today}},
-                        {"property": due_name, "date": {"before": today}},
-                    ]
-                }
-            )
-
         payload: Dict = {"page_size": 100}
-        if len(filters) == 1:
-            payload["filter"] = filters[0]
-        elif len(filters) > 1:
-            payload["filter"] = {"and": filters}
-
         if due_name:
             payload["sorts"] = [
                 {"property": due_name, "direction": "ascending"},
@@ -573,8 +534,57 @@ class NotionIntegration:
             ]
         else:
             payload["sorts"] = [{"timestamp": "last_edited_time", "direction": "descending"}]
-
         return payload
+
+    def _evaluate_task_inclusion(self, task: Dict) -> Tuple[bool, str]:
+        """Decide si la tarea entra al motor diario y explica el motivo."""
+        today = datetime.now().date()
+        status = self._normalize_label(task.get("status", ""))
+        due_date = task.get("due_date")
+
+        completed_aliases = {"completado", "completed", "done", "hecho", "listo", "finalizado"}
+        if status in completed_aliases:
+            return False, "descartada: ya completada"
+
+        if not due_date:
+            return False, "descartada: no tiene fecha limite"
+
+        try:
+            due = datetime.fromisoformat(due_date[:10]).date()
+        except ValueError:
+            return False, f"descartada: fecha invalida ({due_date})"
+
+        if due < today:
+            return True, "incluida: vencida"
+        if due == today:
+            return True, "incluida: vence hoy"
+        return False, f"descartada: vence mas adelante ({due.isoformat()})"
+
+    def _query_all_results(self, data_source_id: str, payload: Dict) -> List[Dict]:
+        """Consulta todas las paginas del data source con paginacion."""
+        url = f"data_sources/{data_source_id}/query"
+        all_results: List[Dict] = []
+        cursor = None
+
+        while True:
+            request_payload = dict(payload)
+            if cursor:
+                request_payload["start_cursor"] = cursor
+
+            response = self._request("POST", url, json=request_payload)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Notion devolvio {response.status_code} al consultar tareas: "
+                    f"{parse_notion_error(response)} | payload={request_payload}"
+                )
+
+            data = response.json()
+            all_results.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+
+        return all_results
 
     def _extract_task_from_result(self, result: Dict, properties: Dict) -> Dict:
         """Extrae una tarea adaptandose al esquema real del data source."""
@@ -692,30 +702,38 @@ class NotionIntegration:
             "context": context_value,
         }
 
-    def query_database(self, database_id: str) -> List[Dict]:
-        """Consulta tareas no completadas de hoy o vencidas."""
+    def query_database(self, database_id: str) -> Tuple[List[Dict], Dict]:
+        """Consulta tareas del hub y devuelve diagnostico de filtrado."""
         try:
             data_source_id = self._resolve_data_source_id(database_id)
             properties = self._get_data_source_schema(data_source_id)
-            url = f"data_sources/{data_source_id}/query"
             payload = self._build_query_payload(properties)
-
-            response = self._request("POST", url, json=payload)
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Notion devolvio {response.status_code} al consultar tareas: "
-                    f"{parse_notion_error(response)} | payload={payload}"
-                )
+            raw_results = self._query_all_results(data_source_id, payload)
 
             tasks = []
-            for result in response.json().get("results", []):
-                tasks.append(self._extract_task_from_result(result, properties))
+            discarded = []
+            all_tasks = []
+            for result in raw_results:
+                task = self._extract_task_from_result(result, properties)
+                included, reason = self._evaluate_task_inclusion(task)
+                task["diagnostic_reason"] = reason
+                all_tasks.append(task)
+                if included:
+                    tasks.append(task)
+                else:
+                    discarded.append(task)
 
             logger.info("%s tareas obtenidas de Notion", len(tasks))
-            return tasks
+            logger.info("%s tareas descartadas por reglas de inclusion", len(discarded))
+            diagnostics = {
+                "total_tasks_seen": len(all_tasks),
+                "included_tasks": tasks,
+                "discarded_tasks": discarded,
+            }
+            return tasks, diagnostics
         except Exception as exc:
             logger.error("Error consultando Notion: %s", exc)
-            return []
+            return [], {"total_tasks_seen": 0, "included_tasks": [], "discarded_tasks": []}
 
     def _make_rich_text(self, text: str) -> List[Dict]:
         return [{"type": "text", "text": {"content": text[:2000]}}]
@@ -727,6 +745,7 @@ class NotionIntegration:
         free_slots: List[Dict],
         tasks: List[Dict],
         timestamp: datetime,
+        diagnostics: Optional[Dict] = None,
     ) -> bool:
         """Agrega un reporte resumido a la pagina de salida."""
         try:
@@ -813,6 +832,70 @@ class NotionIntegration:
                             "bulleted_list_item": {
                                 "rich_text": self._make_rich_text(
                                     f"{slot['label']} ({slot['duration_minutes']} min)"
+                                )
+                            },
+                        }
+                    )
+
+            if diagnostics:
+                blocks.append(
+                    {
+                        "object": "block",
+                        "type": "heading_3",
+                        "heading_3": {"rich_text": self._make_rich_text("Diagnostico del motor")},
+                    }
+                )
+                blocks.append(
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": self._make_rich_text(
+                                f"Eventos hoy: {diagnostics.get('today_events_count', 0)} | "
+                                f"Eventos mañana: {diagnostics.get('tomorrow_events_count', 0)} | "
+                                f"Tareas incluidas: {len(diagnostics.get('included_tasks', []))} | "
+                                f"Tareas descartadas: {len(diagnostics.get('discarded_tasks', []))} | "
+                                f"Tareas no agendadas: {len(diagnostics.get('unscheduled_tasks', []))}"
+                            )
+                        },
+                    }
+                )
+
+                for calendar in diagnostics.get("calendar_snapshot", [])[:8]:
+                    blocks.append(
+                        {
+                            "object": "block",
+                            "type": "bulleted_list_item",
+                            "bulleted_list_item": {
+                                "rich_text": self._make_rich_text(
+                                    f"Calendario: {calendar.get('calendar_name') or calendar.get('summary')} | "
+                                    f"tipo={calendar.get('source_type')} | primary={calendar.get('primary')}"
+                                )
+                            },
+                        }
+                    )
+
+                for task in diagnostics.get("discarded_tasks", [])[:5]:
+                    blocks.append(
+                        {
+                            "object": "block",
+                            "type": "bulleted_list_item",
+                            "bulleted_list_item": {
+                                "rich_text": self._make_rich_text(
+                                    f"Descartada: {task.get('title')} | {task.get('diagnostic_reason')}"
+                                )
+                            },
+                        }
+                    )
+
+                for task in diagnostics.get("unscheduled_tasks", [])[:5]:
+                    blocks.append(
+                        {
+                            "object": "block",
+                            "type": "bulleted_list_item",
+                            "bulleted_list_item": {
+                                "rich_text": self._make_rich_text(
+                                    f"No agendada: {task.get('task_title')} | {task.get('reason')}"
                                 )
                             },
                         }
@@ -1161,8 +1244,8 @@ class MotorDeSugerencias:
         return free_slots
 
     @classmethod
-    def generate(cls, tasks: List[Dict], free_slots: List[Dict]) -> List[Dict]:
-        """Empareja tareas con huecos disponibles."""
+    def generate(cls, tasks: List[Dict], free_slots: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """Empareja tareas con huecos disponibles y devuelve diagnostico de descarte."""
         ordered_tasks = sorted(
             tasks,
             key=lambda task: (
@@ -1173,22 +1256,42 @@ class MotorDeSugerencias:
 
         available_slots = free_slots.copy()
         suggestions = []
+        unscheduled = []
 
         for task in ordered_tasks:
             needed_minutes = task.get("estimated_minutes") or cls.DEFAULT_TASK_MINUTES.get(
                 task.get("priority", "Normal"),
                 45,
             )
+            matching_slots = [
+                candidate
+                for candidate in available_slots
+                if cls._context_matches(task.get("context"), candidate.get("context", "flexible"))
+            ]
             slot = next(
-                (
-                    candidate
-                    for candidate in available_slots
-                    if candidate["duration_minutes"] >= needed_minutes
-                    and cls._context_matches(task.get("context"), candidate.get("context", "flexible"))
-                ),
+                (candidate for candidate in matching_slots if candidate["duration_minutes"] >= needed_minutes),
                 None,
             )
             if not slot:
+                if not matching_slots:
+                    unscheduled.append(
+                        {
+                            "task_title": task["title"],
+                            "reason": "sin hueco compatible con su contexto",
+                            "required_minutes": needed_minutes,
+                            "context": task.get("context"),
+                        }
+                    )
+                else:
+                    max_minutes = max(candidate["duration_minutes"] for candidate in matching_slots)
+                    unscheduled.append(
+                        {
+                            "task_title": task["title"],
+                            "reason": f"no cabe: necesita {needed_minutes} min y el mejor hueco compatible tiene {max_minutes} min",
+                            "required_minutes": needed_minutes,
+                            "context": task.get("context"),
+                        }
+                    )
                 continue
 
             reason = ExplicadorDeSugerencias.build_reason(task, slot)
@@ -1204,7 +1307,7 @@ class MotorDeSugerencias:
             )
             available_slots.remove(slot)
 
-        return suggestions
+        return suggestions, unscheduled
 
 
 class EmailConstructor:
@@ -1722,6 +1825,101 @@ class EmailSender:
             return False
 
 
+class DiagnosticReporter:
+    """Construye y emite reportes de diagnostico para logs y Notion."""
+
+    @staticmethod
+    def build(
+        calendar_snapshot: List[Dict],
+        events: List[Dict],
+        tasks_diagnostics: Dict,
+        unscheduled_tasks: List[Dict],
+        tz_name: str,
+    ) -> Dict:
+        tz = get_timezone(tz_name)
+        today_events, tomorrow_events = split_events_by_day(events, tz)
+
+        events_by_calendar: Dict[str, Dict] = {}
+        for event in events:
+            calendar_name = event.get("calendar_name") or event.get("calendar_id", "Calendario")
+            bucket = events_by_calendar.setdefault(
+                calendar_name,
+                {
+                    "source_type": event.get("source_type", "general"),
+                    "today_count": 0,
+                    "tomorrow_count": 0,
+                },
+            )
+            event_day = event["start"].astimezone(tz).date()
+            if event_day == datetime.now(tz).date():
+                bucket["today_count"] += 1
+            elif event_day == datetime.now(tz).date() + timedelta(days=1):
+                bucket["tomorrow_count"] += 1
+
+        return {
+            "calendar_snapshot": calendar_snapshot,
+            "events_by_calendar": events_by_calendar,
+            "today_events_count": len(today_events),
+            "tomorrow_events_count": len(tomorrow_events),
+            "included_tasks": tasks_diagnostics.get("included_tasks", []),
+            "discarded_tasks": tasks_diagnostics.get("discarded_tasks", []),
+            "unscheduled_tasks": unscheduled_tasks,
+        }
+
+    @staticmethod
+    def log(report: Dict):
+        logger.info("=== DIAGNOSTICO: CALENDARIOS DETECTADOS ===")
+        for calendar in report.get("calendar_snapshot", []):
+            logger.info(
+                "calendar=%s | type=%s | primary=%s | score=%s",
+                calendar.get("calendar_name") or calendar.get("summary"),
+                calendar.get("source_type"),
+                calendar.get("primary"),
+                calendar.get("source_score"),
+            )
+
+        logger.info("=== DIAGNOSTICO: EVENTOS POR CALENDARIO ===")
+        for name, stats in report.get("events_by_calendar", {}).items():
+            logger.info(
+                "calendar=%s | type=%s | hoy=%s | manana=%s",
+                name,
+                stats.get("source_type"),
+                stats.get("today_count"),
+                stats.get("tomorrow_count"),
+            )
+
+        logger.info("=== DIAGNOSTICO: TAREAS INCLUIDAS ===")
+        for task in report.get("included_tasks", []):
+            logger.info(
+                "task=%s | reason=%s | due=%s | context=%s | estimated=%s",
+                task.get("title"),
+                task.get("diagnostic_reason"),
+                task.get("due_date"),
+                task.get("context"),
+                task.get("estimated_minutes"),
+            )
+
+        logger.info("=== DIAGNOSTICO: TAREAS DESCARTADAS ===")
+        for task in report.get("discarded_tasks", []):
+            logger.info(
+                "task=%s | reason=%s | due=%s | status=%s",
+                task.get("title"),
+                task.get("diagnostic_reason"),
+                task.get("due_date"),
+                task.get("status"),
+            )
+
+        logger.info("=== DIAGNOSTICO: TAREAS NO AGENDADAS ===")
+        for task in report.get("unscheduled_tasks", []):
+            logger.info(
+                "task=%s | reason=%s | required=%s | context=%s",
+                task.get("task_title"),
+                task.get("reason"),
+                task.get("required_minutes"),
+                task.get("context"),
+            )
+
+
 class Asistente:
     """Orquesta todo el flujo del sistema."""
 
@@ -1731,6 +1929,7 @@ class Asistente:
         self.tasks: List[Dict] = []
         self.free_slots: List[Dict] = []
         self.suggestions: List[Dict] = []
+        self.diagnostics: Dict = {}
 
     def run(self) -> int:
         try:
@@ -1754,14 +1953,26 @@ class Asistente:
                 self.config.NOTION_API_KEY,
                 self.config.NOTION_VERSION,
             )
-            self.tasks = notion.query_database(self.config.NOTION_DATABASE_ID)
+            self.tasks, tasks_diagnostics = notion.query_database(self.config.NOTION_DATABASE_ID)
 
             logger.info("Calcular huecos y sugerencias...")
             self.free_slots = MotorDeSugerencias.find_free_slots(
                 self.events,
                 self.config.TIMEZONE,
             )
-            self.suggestions = MotorDeSugerencias.generate(self.tasks, self.free_slots)
+            self.suggestions, unscheduled_tasks = MotorDeSugerencias.generate(
+                self.tasks,
+                self.free_slots,
+            )
+            self.diagnostics = DiagnosticReporter.build(
+                calendar.get_calendar_snapshot(),
+                self.events,
+                tasks_diagnostics,
+                unscheduled_tasks,
+                self.config.TIMEZONE,
+            )
+            if self.config.DIAGNOSTIC_MODE:
+                DiagnosticReporter.log(self.diagnostics)
 
             now = datetime.now(timezone.utc)
 
@@ -1796,6 +2007,7 @@ class Asistente:
                 self.free_slots,
                 self.tasks,
                 now.astimezone(get_timezone(self.config.TIMEZONE)),
+                self.diagnostics if self.config.DIAGNOSTIC_MODE else None,
             )
             if not notion_ok:
                 return 1
