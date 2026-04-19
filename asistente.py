@@ -797,6 +797,86 @@ class EmailConstructor:
     ) -> str:
         critical_tasks = [task for task in tasks if task.get("priority") in ["Alta", "Urgente"]]
         local_tz = get_timezone(tz_name)
+        date_str = timestamp.astimezone(local_tz).strftime("%d/%m/%Y %H:%M")
+
+        total_minutes = sum(event["duration_minutes"] for event in events)
+        top_suggestion = suggestions[0] if suggestions else None
+
+        suggestion_cards_html = ""
+        for suggestion in suggestions[:4]:
+            priority = suggestion.get("priority", "Normal")
+            priority_color = {
+                "Urgente": "#ef4444",
+                "Alta": "#f97316",
+                "Normal": "#2563eb",
+                "Baja": "#64748b",
+            }.get(priority, "#2563eb")
+            suggestion_cards_html += f"""
+            <tr>
+                <td style="padding-bottom: 14px;">
+                    <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:18px; padding:20px 22px;">
+                        <div style="font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color:{priority_color}; margin-bottom:10px;">
+                            {priority}
+                        </div>
+                        <div style="font-size:18px; line-height:1.35; font-weight:700; color:#0f172a; margin-bottom:8px;">
+                            {suggestion['task_title']}
+                        </div>
+                        <div style="font-size:14px; color:#334155; margin-bottom:8px;">
+                            Recomendado para {suggestion['slot_label']} ({suggestion['slot_duration']} min)
+                        </div>
+                        <div style="font-size:13px; color:#64748b; line-height:1.6;">
+                            {suggestion['reason']}
+                        </div>
+                    </div>
+                </td>
+            </tr>
+            """
+
+        gaps_cards_html = ""
+        for slot in free_slots[:4]:
+            gaps_cards_html += f"""
+            <td style="padding:0 8px 12px 8px; vertical-align:top;">
+                <div style="background:linear-gradient(180deg, #ffffff 0%, #f8fafc 100%); border:1px solid #dbeafe; border-radius:18px; padding:18px;">
+                    <div style="font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:1px; color:#3b82f6; margin-bottom:8px;">
+                        Bloque libre
+                    </div>
+                    <div style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:6px;">
+                        {slot['label']}
+                    </div>
+                    <div style="font-size:13px; color:#64748b;">
+                        {slot['duration_minutes']} minutos disponibles
+                    </div>
+                </div>
+            </td>
+            """
+
+        tasks_html = ""
+        for task in critical_tasks[:4]:
+            priority = task.get("priority", "Normal")
+            priority_color = {
+                "Urgente": "#ef4444",
+                "Alta": "#f97316",
+                "Normal": "#2563eb",
+                "Baja": "#64748b",
+            }.get(priority, "#2563eb")
+            metric = MetricasDeValor.get_metric(task["title"], task.get("category", ""))
+            tasks_html += f"""
+            <tr>
+                <td style="padding: 0 0 12px 0;">
+                    <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:16px 18px;">
+                        <div style="font-size:16px; font-weight:700; color:#0f172a; margin-bottom:6px;">
+                            {task['title']}
+                        </div>
+                        <div style="font-size:13px; color:{priority_color}; font-weight:700; margin-bottom:4px;">
+                            Prioridad: {priority}
+                        </div>
+                        <div style="font-size:13px; color:#64748b; line-height:1.5;">
+                            {metric}
+                        </div>
+                    </div>
+                </td>
+            </tr>
+            """
 
         time_blocks_html = ""
         for event in events[:6]:
@@ -821,41 +901,6 @@ class EmailConstructor:
             </tr>
             """
 
-        free_slots_html = ""
-        for slot in free_slots[:5]:
-            free_slots_html += f"""
-            <div style="background: #eef6ff; border-left: 4px solid #2b6cb0; padding: 12px; margin: 8px 0; border-radius: 4px;">
-                <strong>{slot['label']}</strong>
-                <br/>
-                <small style="color: #4a5568;">Disponible: {slot['duration_minutes']} minutos</small>
-            </div>
-            """
-
-        suggestions_html = ""
-        for suggestion in suggestions[:5]:
-            suggestions_html += f"""
-            <div style="background: #f0fff4; border-left: 4px solid #2f855a; padding: 12px; margin: 8px 0; border-radius: 4px;">
-                <strong>{suggestion['task_title']}</strong>
-                <br/>
-                <small style="color: #2d3748;">
-                    Recomendado para {suggestion['slot_label']} ({suggestion['slot_duration']} min)
-                </small>
-                <br/>
-                <small style="color: #4a5568;">{suggestion['reason']}</small>
-            </div>
-            """
-
-        critical_tasks_html = ""
-        for task in critical_tasks[:3]:
-            metric = MetricasDeValor.get_metric(task["title"], task.get("category", ""))
-            critical_tasks_html += f"""
-            <div style="background: #fffaf0; border-left: 4px solid #dd6b20; padding: 12px; margin: 8px 0; border-radius: 4px;">
-                <strong>{task['title']}</strong>
-                <br/>
-                <small style="color: #4a5568;">Prioridad: {task['priority']} | {metric}</small>
-            </div>
-            """
-
         html = f"""
         <!DOCTYPE html>
         <html lang="es">
@@ -866,37 +911,69 @@ class EmailConstructor:
                 body {{
                     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
                     line-height: 1.6;
-                    color: #333;
-                    background-color: #f8f9fa;
+                    color: #0f172a;
+                    background: linear-gradient(180deg, #eef4ff 0%, #f8fafc 48%, #eef2ff 100%);
                     margin: 0;
                     padding: 0;
                 }}
                 .container {{
                     max-width: 720px;
                     margin: 0 auto;
-                    background-color: white;
-                    border-radius: 10px;
+                    background-color: transparent;
+                    border-radius: 0;
                     overflow: hidden;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
                 }}
-                .header {{
-                    background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%);
-                    color: white;
-                    padding: 32px 28px;
-                    text-align: center;
+                .shell {{
+                    padding: 28px 18px 40px 18px;
                 }}
-                .content {{
-                    padding: 28px;
+                .hero {{
+                    background: radial-gradient(circle at top left, #dbeafe 0%, #ffffff 38%, #f8fafc 100%);
+                    border: 1px solid #dbeafe;
+                    border-radius: 28px;
+                    padding: 34px 30px 28px 30px;
+                    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+                    margin-bottom: 18px;
                 }}
-                .section {{
-                    margin-bottom: 28px;
-                }}
-                .section h2 {{
-                    font-size: 16px;
+                .eyebrow {{
+                    display: inline-block;
+                    font-size: 11px;
+                    font-weight: 700;
+                    letter-spacing: 1.2px;
                     text-transform: uppercase;
-                    letter-spacing: 0.4px;
-                    border-bottom: 2px solid #e2e8f0;
-                    padding-bottom: 8px;
+                    color: #2563eb;
+                    background: #eff6ff;
+                    border: 1px solid #bfdbfe;
+                    border-radius: 999px;
+                    padding: 6px 10px;
+                    margin-bottom: 18px;
+                }}
+                .hero h1 {{
+                    font-size: 34px;
+                    line-height: 1.1;
+                    letter-spacing: -1px;
+                    margin: 0 0 10px 0;
+                    color: #0f172a;
+                }}
+                .hero p {{
+                    margin: 0;
+                    font-size: 15px;
+                    color: #475569;
+                }}
+                .section-title {{
+                    font-size: 12px;
+                    font-weight: 700;
+                    text-transform: uppercase;
+                    letter-spacing: 1.2px;
+                    color: #64748b;
+                    margin: 0 0 12px 0;
+                }}
+                .panel {{
+                    background: rgba(255,255,255,0.84);
+                    border: 1px solid #e2e8f0;
+                    border-radius: 24px;
+                    padding: 24px;
+                    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.05);
+                    margin-bottom: 18px;
                 }}
                 table {{
                     width: 100%;
@@ -904,61 +981,129 @@ class EmailConstructor:
                     font-size: 13px;
                 }}
                 th {{
-                    background: #f1f5f9;
+                    background: #f8fafc;
                     text-align: left;
                     padding: 12px;
+                    color: #334155;
+                    border-bottom: 1px solid #e2e8f0;
                 }}
                 .footer {{
-                    background: #f8fafc;
-                    padding: 20px 28px;
+                    padding: 10px 18px 0 18px;
                     text-align: center;
                     color: #64748b;
                     font-size: 12px;
+                }}
+                .metric-card {{
+                    background: rgba(255,255,255,0.74);
+                    border: 1px solid #e2e8f0;
+                    border-radius: 18px;
+                    padding: 18px;
+                }}
+                .metric-value {{
+                    font-size: 26px;
+                    font-weight: 700;
+                    line-height: 1.1;
+                    color: #0f172a;
+                    margin-bottom: 6px;
+                }}
+                .metric-label {{
+                    font-size: 12px;
+                    color: #64748b;
+                    text-transform: uppercase;
+                    letter-spacing: 1px;
                 }}
             </style>
         </head>
         <body>
             <div class="container">
-                <div class="header">
-                    <h1 style="margin: 0;">Asistente</h1>
-                    <p style="margin: 8px 0 0 0;">Plan de productividad sugerido</p>
-                    <p style="margin: 8px 0 0 0;">{timestamp.astimezone(local_tz).strftime('%d/%m/%Y %H:%M')}</p>
-                </div>
-                <div class="content">
-                    <div class="section">
-                        <h2>Sugerencias</h2>
-                        {suggestions_html if suggestions_html else '<p style="color:#64748b;">No se encontraron emparejamientos entre tareas y huecos disponibles.</p>'}
+                <div class="shell">
+                    <div class="hero">
+                        <div class="eyebrow">Asistente diario</div>
+                        <h1>Tu agenda ya tiene una mejor version.</h1>
+                        <p>Resumen premium de tareas, huecos disponibles y recomendaciones accionables para hoy.</p>
+                        <p style="margin-top:10px; font-size:13px; color:#64748b;">{date_str}</p>
+
+                        <table role="presentation" style="margin-top:24px;">
+                            <tr>
+                                <td style="width:33.33%; padding-right:8px; vertical-align:top;">
+                                    <div class="metric-card">
+                                        <div class="metric-value">{len(tasks)}</div>
+                                        <div class="metric-label">Tareas pendientes</div>
+                                    </div>
+                                </td>
+                                <td style="width:33.33%; padding:0 4px; vertical-align:top;">
+                                    <div class="metric-card">
+                                        <div class="metric-value">{len(free_slots)}</div>
+                                        <div class="metric-label">Huecos detectados</div>
+                                    </div>
+                                </td>
+                                <td style="width:33.33%; padding-left:8px; vertical-align:top;">
+                                    <div class="metric-card">
+                                        <div class="metric-value">{total_minutes}</div>
+                                        <div class="metric-label">Minutos agendados</div>
+                                    </div>
+                                </td>
+                            </tr>
+                        </table>
                     </div>
 
-                    <div class="section">
-                        <h2>Huecos detectados</h2>
-                        {free_slots_html if free_slots_html else '<p style="color:#64748b;">No se detectaron huecos libres de al menos 30 minutos.</p>'}
+                    <div class="panel">
+                        <div class="section-title">Sugerencia principal</div>
+                        <div style="background:linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%); border-radius:22px; padding:24px; color:#ffffff;">
+                            <div style="font-size:12px; text-transform:uppercase; letter-spacing:1.2px; opacity:0.8; margin-bottom:10px;">
+                                Hoja de ruta sugerida
+                            </div>
+                            <div style="font-size:24px; line-height:1.2; font-weight:700; margin-bottom:10px;">
+                                {top_suggestion['task_title'] if top_suggestion else 'Analizando tu flujo optimo...'}
+                            </div>
+                            <div style="font-size:14px; line-height:1.6; color:rgba(255,255,255,0.84);">
+                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion['slot_duration']} min). {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
+                            </div>
+                        </div>
                     </div>
 
-                    <div class="section">
-                        <h2>Tareas criticas</h2>
-                        {critical_tasks_html if critical_tasks_html else '<p style="color:#64748b;">No hay tareas criticas pendientes.</p>'}
+                    <div class="panel">
+                        <div class="section-title">Sugerencias priorizadas</div>
+                        <table role="presentation">
+                            {suggestion_cards_html if suggestion_cards_html else '<tr><td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">No se encontraron emparejamientos entre tareas y huecos disponibles.</div></td></tr>'}
+                        </table>
                     </div>
 
-                    <div class="section">
-                        <h2>Eventos del calendario</h2>
+                    <div class="panel">
+                        <div class="section-title">Disponibilidad del dia</div>
+                        <table role="presentation">
+                            <tr>
+                                {gaps_cards_html if gaps_cards_html else '<td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">Sin bloques libres detectados hoy.</div></td>'}
+                            </tr>
+                        </table>
+                    </div>
+
+                    <div class="panel">
+                        <div class="section-title">Objetivos criticos</div>
+                        <table role="presentation">
+                            {tasks_html if tasks_html else '<tr><td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">No hay tareas criticas pendientes para hoy.</div></td></tr>'}
+                        </table>
+                    </div>
+
+                    <div class="panel">
+                        <div class="section-title">Agenda importada desde Google Calendar</div>
                         <table>
                             <thead>
                                 <tr>
                                     <th>Hora</th>
                                     <th>Actividad</th>
                                     <th>Duracion</th>
-                                    <th>Valor</th>
+                                    <th>Valor estrategico</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {time_blocks_html if time_blocks_html else '<tr><td colspan="4" style="padding: 12px; text-align:center; color:#64748b;">Sin eventos programados</td></tr>'}
+                                {time_blocks_html if time_blocks_html else '<tr><td colspan="4" style="padding: 16px; text-align:center; color:#64748b;">Sin eventos programados en las proximas 24 horas.</td></tr>'}
                             </tbody>
                         </table>
                     </div>
                 </div>
                 <div class="footer">
-                    Tareas pendientes: {len(tasks)} | Eventos: {len(events)} | Huecos: {len(free_slots)}
+                    Enviado por <strong>Asistente</strong> | Tareas: {len(tasks)} | Eventos: {len(events)} | Huecos: {len(free_slots)}
                 </div>
             </div>
         </body>
