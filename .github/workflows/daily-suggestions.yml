@@ -2,7 +2,6 @@ name: Motor de Sugerencias Diario
 
 on:
   schedule:
-    # 09:50 UTC = 04:50 AM en Ecuador (America/Guayaquil, UTC-5)
     - cron: '50 9 * * *'
   workflow_dispatch:
 
@@ -33,11 +32,19 @@ jobs:
           NOTION_OUTPUT_PAGE_ID: ${{ secrets.NOTION_OUTPUT_PAGE_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+          GOOGLE_OAUTH_TOKEN_URI: ${{ secrets.GOOGLE_OAUTH_TOKEN_URI }}
+
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           TIMEZONE: ${{ secrets.TIMEZONE }}
+          TASK_HUB_URL: ${{ secrets.TASK_HUB_URL }}
+          DIAGNOSTIC_MODE: ${{ secrets.DIAGNOSTIC_MODE }}
         run: |
           python asistente.py
