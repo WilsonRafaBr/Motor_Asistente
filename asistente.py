@@ -85,6 +85,7 @@ class ConfigAsistente:
 
     GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
+    GOOGLE_CALENDAR_IDS = os.environ.get("GOOGLE_CALENDAR_IDS")
 
     NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
     NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
@@ -99,6 +100,16 @@ class ConfigAsistente:
     EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_FROM)
 
     TIMEZONE = os.environ.get("TIMEZONE", "America/Guayaquil")
+
+    @staticmethod
+    def get_calendar_ids() -> List[str]:
+        """Devuelve la lista de calendarios a consultar."""
+        raw_ids = ConfigAsistente.GOOGLE_CALENDAR_IDS
+        if raw_ids:
+            parsed = [item.strip() for item in raw_ids.split(",") if item.strip()]
+            if parsed:
+                return parsed
+        return ["ALL"]
 
     @staticmethod
     def validate():
@@ -174,6 +185,100 @@ def split_events_by_day(events: List[Dict], tz) -> Tuple[List[Dict], List[Dict]]
     return today_events, tomorrow_events
 
 
+class CalendarSourceIntelligence:
+    """Clasifica calendarios y resuelve duplicados entre fuentes espejo."""
+
+    ACADEMIC_KEYWORDS = {
+        "class",
+        "clase",
+        "facultad",
+        "universidad",
+        "campus",
+        "horario",
+        "schedule",
+        "rotacion",
+        "rotation",
+        "hospital",
+        "medicina",
+    }
+    NOTION_KEYWORDS = {"notion", "task hub", "database", "calendar"}
+    PERSONAL_KEYWORDS = {"personal", "home", "casa", "vida"}
+
+    @staticmethod
+    def normalize_text(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        return (
+            value.lower()
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+        )
+
+    @classmethod
+    def classify_calendar(cls, calendar_meta: Dict) -> Dict:
+        """Clasifica un calendario por nombre/descripcion."""
+        title = calendar_meta.get("summary", "")
+        description = calendar_meta.get("description", "")
+        text = cls.normalize_text(f"{title} {description}")
+
+        source_type = "general"
+        score = 40
+
+        if any(keyword in text for keyword in cls.ACADEMIC_KEYWORDS):
+            source_type = "academic"
+            score = 100
+        elif any(keyword in text for keyword in cls.NOTION_KEYWORDS):
+            source_type = "notion_mirror"
+            score = 50
+        elif any(keyword in text for keyword in cls.PERSONAL_KEYWORDS):
+            source_type = "personal"
+            score = 70
+        elif calendar_meta.get("primary"):
+            source_type = "primary"
+            score = 80
+
+        return {
+            "calendar_name": title or calendar_meta.get("id", "Calendario"),
+            "source_type": source_type,
+            "source_score": score,
+        }
+
+    @classmethod
+    def event_fingerprint(cls, event: Dict) -> Tuple[str, str, str]:
+        summary = cls.normalize_text(event.get("summary", "")).strip()
+        summary = " ".join(summary.split())
+        start = event["start"].isoformat()
+        end = event["end"].isoformat()
+        return summary, start, end
+
+    @classmethod
+    def dedupe_events(cls, events: List[Dict]) -> List[Dict]:
+        """Elimina duplicados priorizando calendarios mas utiles."""
+        chosen: Dict[Tuple[str, str, str], Dict] = {}
+
+        for event in events:
+            key = cls.event_fingerprint(event)
+            current = chosen.get(key)
+            if not current:
+                chosen[key] = event
+                continue
+
+            if event.get("source_score", 0) > current.get("source_score", 0):
+                chosen[key] = event
+                continue
+
+            if (
+                event.get("source_score", 0) == current.get("source_score", 0)
+                and len(event.get("calendar_name", "")) < len(current.get("calendar_name", ""))
+            ):
+                chosen[key] = event
+
+        return sorted(chosen.values(), key=lambda item: item["start"])
+
+
 class GoogleCalendarIntegration:
     """Obtiene eventos de Google Calendar para las proximas 24 horas."""
 
@@ -190,47 +295,111 @@ class GoogleCalendarIntegration:
             logger.error("Error autenticando Google Calendar: %s", exc)
             raise
 
-    def get_events_horizon(self, calendar_id: str = "primary", hours: int = 48) -> List[Dict]:
-        """Obtiene todos los eventos del horizonte solicitado."""
+    @staticmethod
+    def _normalize_event_datetime(value: str, is_end: bool = False) -> datetime:
+        """Convierte date o dateTime de Google Calendar en datetime UTC-aware."""
+        if "T" in value:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        base_date = datetime.fromisoformat(value)
+        if is_end:
+            return base_date.replace(tzinfo=timezone.utc)
+        return base_date.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _build_event_payload(raw_event: Dict, calendar_id: str) -> Dict:
+        """Normaliza un evento de Google Calendar."""
+        start_raw = raw_event["start"].get("dateTime", raw_event["start"].get("date"))
+        end_raw = raw_event["end"].get("dateTime", raw_event["end"].get("date"))
+        is_all_day = "date" in raw_event["start"] and "dateTime" not in raw_event["start"]
+
+        start_dt = GoogleCalendarIntegration._normalize_event_datetime(start_raw, is_end=False)
+        end_dt = GoogleCalendarIntegration._normalize_event_datetime(end_raw, is_end=True)
+        duration_min = int((end_dt - start_dt).total_seconds() / 60)
+
+        return {
+            "id": raw_event["id"],
+            "calendar_id": calendar_id,
+            "summary": raw_event.get("summary", "Evento sin titulo"),
+            "start": start_dt,
+            "end": end_dt,
+            "duration_minutes": duration_min,
+            "is_all_day": is_all_day,
+        }
+
+    def get_available_calendars(self) -> List[Dict]:
+        """Lista calendarios visibles para la cuenta/integracion."""
+        calendars = []
+        page_token = None
+
+        while True:
+            response = (
+                self.service.calendarList()
+                .list(pageToken=page_token)
+                .execute()
+            )
+            calendars.extend(response.get("items", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+        return calendars
+
+    def get_events_horizon(self, calendar_ids: List[str], hours: int = 48) -> List[Dict]:
+        """Obtiene todos los eventos del horizonte solicitado para uno o varios calendarios."""
         try:
             now = datetime.now(timezone.utc)
             end_time = now + timedelta(hours=hours)
-
-            events_result = (
-                self.service.events()
-                .list(
-                    calendarId=calendar_id,
-                    timeMin=now.isoformat(),
-                    timeMax=end_time.isoformat(),
-                    singleEvents=True,
-                    orderBy="startTime",
-                    fields="items(id,summary,start,end)",
-                )
-                .execute()
-            )
-
             events = []
-            for event in events_result.get("items", []):
-                start = event["start"].get("dateTime", event["start"].get("date"))
-                end = event["end"].get("dateTime", event["end"].get("date"))
+            available_calendars = {item["id"]: item for item in self.get_available_calendars()}
 
-                if isinstance(start, str) and "T" in start:
-                    start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                    end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                    duration_min = int((end_dt - start_dt).total_seconds() / 60)
+            if calendar_ids == ["ALL"]:
+                selected_calendar_ids = list(available_calendars.keys())
+            else:
+                selected_calendar_ids = calendar_ids
 
-                    events.append(
-                        {
-                            "id": event["id"],
-                            "summary": event.get("summary", "Evento sin titulo"),
-                            "start": start_dt,
-                            "end": end_dt,
-                            "duration_minutes": duration_min,
-                        }
+            for calendar_id in selected_calendar_ids:
+                if calendar_id not in available_calendars and calendar_id != "primary":
+                    logger.warning("El calendario %s no aparece en calendarList; se intentara consultar igual.", calendar_id)
+
+                page_token = None
+                while True:
+                    events_result = (
+                        self.service.events()
+                        .list(
+                            calendarId=calendar_id,
+                            timeMin=now.isoformat(),
+                            timeMax=end_time.isoformat(),
+                            singleEvents=True,
+                            orderBy="startTime",
+                            pageToken=page_token,
+                            fields="items(id,summary,start,end),nextPageToken",
+                        )
+                        .execute()
                     )
 
-            logger.info("%s eventos encontrados en proximas %sh", len(events), hours)
-            return events
+                    for event in events_result.get("items", []):
+                        payload = self._build_event_payload(event, calendar_id)
+                        calendar_meta = available_calendars.get(calendar_id, {"id": calendar_id, "summary": calendar_id})
+                        payload.update(CalendarSourceIntelligence.classify_calendar(calendar_meta))
+                        events.append(payload)
+
+                    page_token = events_result.get("nextPageToken")
+                    if not page_token:
+                        break
+
+            normalized_events = CalendarSourceIntelligence.dedupe_events(events)
+
+            logger.info(
+                "%s eventos encontrados en proximas %sh desde %s calendario(s)",
+                len(normalized_events),
+                hours,
+                len(selected_calendar_ids),
+            )
+            for calendar_id in selected_calendar_ids:
+                logger.info("Calendario consultado: %s", calendar_id)
+
+            return normalized_events
         except Exception as exc:
             logger.error("Error obteniendo eventos: %s", exc)
             return []
@@ -791,6 +960,8 @@ class MotorDeSugerencias:
 
     @classmethod
     def _is_campus_event(cls, event: Dict) -> bool:
+        if event.get("source_type") == "academic":
+            return True
         text = cls._normalize_text(event.get("summary", ""))
         return any(keyword in text for keyword in cls.CAMPUS_KEYWORDS)
 
@@ -1196,6 +1367,13 @@ class EmailConstructor:
             start_time = event["start"].astimezone(local_tz).strftime("%H:%M")
             end_time = event["end"].astimezone(local_tz).strftime("%H:%M")
             metric = MetricasDeValor.get_metric(event["summary"], "Calendario")
+            source_label = event.get("calendar_name") or event.get("calendar_id", "")
+            if event.get("source_type") == "academic":
+                source_label = f"Académico · {source_label}"
+            elif event.get("source_type") == "notion_mirror":
+                source_label = f"Notion mirror · {source_label}"
+            elif event.get("source_type") == "personal":
+                source_label = f"Personal · {source_label}"
 
             time_blocks_html += f"""
             <tr>
@@ -1204,6 +1382,7 @@ class EmailConstructor:
                 </td>
                 <td style="padding: 12px; border-bottom: 1px solid #e0e0e0;">
                     {event['summary']}
+                    <div style="font-size:11px; color:#64748b; margin-top:4px;">Fuente: {source_label}</div>
                 </td>
                 <td style="padding: 12px; border-bottom: 1px solid #e0e0e0; text-align: center;">
                     {event['duration_minutes']} min
@@ -1218,6 +1397,13 @@ class EmailConstructor:
         for event in tomorrow_events[:6]:
             start_time = event["start"].astimezone(local_tz).strftime("%H:%M")
             end_time = event["end"].astimezone(local_tz).strftime("%H:%M")
+            source_label = event.get("calendar_name") or event.get("calendar_id", "")
+            if event.get("source_type") == "academic":
+                source_label = f"Académico · {source_label}"
+            elif event.get("source_type") == "notion_mirror":
+                source_label = f"Notion mirror · {source_label}"
+            elif event.get("source_type") == "personal":
+                source_label = f"Personal · {source_label}"
             tomorrow_blocks_html += f"""
             <tr>
                 <td style="padding: 12px; border-bottom: 1px solid #cbd5e1;">
@@ -1225,6 +1411,7 @@ class EmailConstructor:
                 </td>
                 <td style="padding: 12px; border-bottom: 1px solid #cbd5e1; color:#0f172a;">
                     {event['summary']}
+                    <div style="font-size:11px; color:#64748b; margin-top:4px;">Fuente: {source_label}</div>
                 </td>
                 <td style="padding: 12px; border-bottom: 1px solid #cbd5e1; text-align: center; color:#334155;">
                     {event['duration_minutes']} min
@@ -1557,7 +1744,10 @@ class Asistente:
 
             logger.info("Obtener eventos de Google Calendar...")
             calendar = GoogleCalendarIntegration(self.config.GOOGLE_CREDENTIALS_JSON)
-            self.events = calendar.get_events_horizon(self.config.GOOGLE_CALENDAR_ID, hours=48)
+            self.events = calendar.get_events_horizon(
+                self.config.get_calendar_ids(),
+                hours=48,
+            )
 
             logger.info("Obtener tareas de Notion...")
             notion = NotionIntegration(
