@@ -90,6 +90,7 @@ class ConfigAsistente:
     NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
     NOTION_OUTPUT_PAGE_ID = os.environ.get("NOTION_OUTPUT_PAGE_ID")
     NOTION_VERSION = os.environ.get("NOTION_VERSION", "2025-09-03")
+    TASK_HUB_URL = os.environ.get("TASK_HUB_URL", "https://www.notion.so/")
 
     SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
@@ -153,6 +154,24 @@ def parse_notion_error(response: requests.Response) -> str:
     if code and message:
         return f"{code}: {message}"
     return message or code or f"HTTP {response.status_code}"
+
+
+def split_events_by_day(events: List[Dict], tz) -> Tuple[List[Dict], List[Dict]]:
+    """Separa eventos entre hoy y mañana segun la zona local."""
+    today = datetime.now(tz).date()
+    tomorrow = today + timedelta(days=1)
+
+    today_events = []
+    tomorrow_events = []
+
+    for event in events:
+        event_day = event["start"].astimezone(tz).date()
+        if event_day == today:
+            today_events.append(event)
+        elif event_day == tomorrow:
+            tomorrow_events.append(event)
+
+    return today_events, tomorrow_events
 
 
 class GoogleCalendarIntegration:
@@ -425,6 +444,11 @@ class NotionIntegration:
                 "Tiempo estimado",
             ],
         )
+        context_name, context_prop = self._find_property(
+            properties,
+            ["select", "status", "multi_select", "rich_text"],
+            ["Contexto", "Context", "Ubicacion", "Lugar"],
+        )
 
         title_items = props.get(title_name or "", {}).get("title", [])
         title_text = self._extract_plain_text(title_items) or "Sin titulo"
@@ -474,6 +498,20 @@ class NotionIntegration:
             if estimated_minutes is not None:
                 estimated_minutes = int(estimated_minutes)
 
+        context_value = None
+        if context_name and context_prop:
+            prop_type = context_prop.get("type")
+            context_data = props.get(context_name, {})
+            if prop_type == "status":
+                context_value = (context_data.get("status") or {}).get("name")
+            elif prop_type == "select":
+                context_value = (context_data.get("select") or {}).get("name")
+            elif prop_type == "multi_select":
+                items = context_data.get("multi_select") or []
+                context_value = items[0]["name"] if items else None
+            elif prop_type == "rich_text":
+                context_value = self._extract_plain_text(context_data.get("rich_text", [])) or None
+
         return {
             "id": result["id"],
             "title": title_text,
@@ -482,6 +520,7 @@ class NotionIntegration:
             "priority": priority_value,
             "category": category_value,
             "estimated_minutes": estimated_minutes,
+            "context": context_value,
         }
 
     def query_database(self, database_id: str) -> List[Dict]:
@@ -717,10 +756,106 @@ class MotorDeSugerencias:
     WORKDAY_START_HOUR = 6
     WORKDAY_END_HOUR = 22
     MIN_SLOT_MINUTES = 30
+    LUNCH_START_HOUR = 13
+    LUNCH_END_HOUR = 14
+    CAMPUS_KEYWORDS = {
+        "clase",
+        "class",
+        "facultad",
+        "universidad",
+        "hospital",
+        "rotacion",
+        "rotation",
+        "lab",
+        "laboratorio",
+        "seminario",
+        "curso",
+    }
 
     @staticmethod
     def _slot_label(start: datetime, end: datetime) -> str:
         return f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}"
+
+    @staticmethod
+    def _normalize_text(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        return (
+            value.lower()
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+        )
+
+    @classmethod
+    def _is_campus_event(cls, event: Dict) -> bool:
+        text = cls._normalize_text(event.get("summary", ""))
+        return any(keyword in text for keyword in cls.CAMPUS_KEYWORDS)
+
+    @staticmethod
+    def _merge_intervals(intervals: List[Dict]) -> List[Dict]:
+        if not intervals:
+            return []
+
+        ordered = sorted(intervals, key=lambda item: item["start"])
+        merged = [ordered[0].copy()]
+
+        for interval in ordered[1:]:
+            current = merged[-1]
+            if interval["start"] <= current["end"]:
+                current["end"] = max(current["end"], interval["end"])
+                current["label"] = f"{current['label']} + {interval['label']}"
+            else:
+                merged.append(interval.copy())
+
+        return merged
+
+    @classmethod
+    def _infer_slot_context(
+        cls,
+        slot_start: datetime,
+        slot_end: datetime,
+        campus_events: List[Dict],
+    ) -> str:
+        previous_event = None
+        for event in campus_events:
+            if event["end_local"] <= slot_start:
+                previous_event = event
+            else:
+                break
+
+        next_event = next(
+            (event for event in campus_events if event["start_local"] >= slot_end),
+            None,
+        )
+
+        if previous_event and next_event:
+            gap_minutes = int(
+                (next_event["start_local"] - previous_event["end_local"]).total_seconds() / 60
+            )
+            if gap_minutes <= 240:
+                return "facultad"
+
+        if previous_event and not next_event:
+            return "casa"
+
+        if next_event and not previous_event:
+            return "casa"
+
+        return "flexible"
+
+    @classmethod
+    def _context_matches(cls, task_context: Optional[str], slot_context: str) -> bool:
+        normalized = cls._normalize_text(task_context)
+        if not normalized:
+            return True
+        if "casa" in normalized or "home" in normalized:
+            return slot_context in {"casa", "flexible"}
+        if "facultad" in normalized or "campus" in normalized or "universidad" in normalized:
+            return slot_context in {"facultad", "flexible"}
+        return True
 
     @classmethod
     def find_free_slots(
@@ -731,6 +866,7 @@ class MotorDeSugerencias:
         """Calcula huecos libres dentro de la jornada del dia actual."""
         tz = get_timezone(tz_name)
         now_local = datetime.now(tz)
+        today = now_local.date()
         day_start = now_local.replace(
             hour=cls.WORKDAY_START_HOUR,
             minute=0,
@@ -752,6 +888,9 @@ class MotorDeSugerencias:
             start_local = event["start"].astimezone(tz)
             end_local = event["end"].astimezone(tz)
 
+            if start_local.date() != today and end_local.date() != today:
+                continue
+
             if end_local <= day_start or start_local >= day_end:
                 continue
 
@@ -764,22 +903,76 @@ class MotorDeSugerencias:
             )
 
         localized_events.sort(key=lambda item: item["start_local"])
+        campus_events = [event for event in localized_events if cls._is_campus_event(event)]
+
+        occupied_intervals = [
+            {
+                "start": event["start_local"],
+                "end": event["end_local"],
+                "label": event["summary"],
+            }
+            for event in localized_events
+        ]
+
+        lunch_start = now_local.replace(
+            hour=cls.LUNCH_START_HOUR,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        lunch_end = now_local.replace(
+            hour=cls.LUNCH_END_HOUR,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        occupied_intervals.append(
+            {"start": lunch_start, "end": lunch_end, "label": "Bloque protegido de almuerzo"}
+        )
+
+        if campus_events:
+            first_class = campus_events[0]
+            last_class = campus_events[-1]
+            occupied_intervals.append(
+                {
+                    "start": max(day_start, first_class["start_local"] - timedelta(hours=1)),
+                    "end": first_class["start_local"],
+                    "label": "Buffer antes de primera clase",
+                }
+            )
+            occupied_intervals.append(
+                {
+                    "start": last_class["end_local"],
+                    "end": min(day_end, last_class["end_local"] + timedelta(hours=1)),
+                    "label": "Buffer despues de ultima clase",
+                }
+            )
+
+        merged_intervals = cls._merge_intervals(
+            [
+                interval
+                for interval in occupied_intervals
+                if interval["end"] > day_start and interval["start"] < day_end
+            ]
+        )
 
         free_slots = []
         cursor = day_start
-        for event in localized_events:
-            if event["start_local"] > cursor:
-                duration = int((event["start_local"] - cursor).total_seconds() / 60)
+        for interval in merged_intervals:
+            if interval["start"] > cursor:
+                duration = int((interval["start"] - cursor).total_seconds() / 60)
                 if duration >= cls.MIN_SLOT_MINUTES:
+                    slot_end = interval["start"]
                     free_slots.append(
                         {
                             "start": cursor,
-                            "end": event["start_local"],
+                            "end": slot_end,
                             "duration_minutes": duration,
-                            "label": cls._slot_label(cursor, event["start_local"]),
+                            "label": cls._slot_label(cursor, slot_end),
+                            "context": cls._infer_slot_context(cursor, slot_end, campus_events),
                         }
                     )
-            cursor = max(cursor, event["end_local"])
+            cursor = max(cursor, interval["end"])
 
         if cursor < day_end:
             duration = int((day_end - cursor).total_seconds() / 60)
@@ -790,6 +983,7 @@ class MotorDeSugerencias:
                         "end": day_end,
                         "duration_minutes": duration,
                         "label": cls._slot_label(cursor, day_end),
+                        "context": cls._infer_slot_context(cursor, day_end, campus_events),
                     }
                 )
 
@@ -815,7 +1009,12 @@ class MotorDeSugerencias:
                 45,
             )
             slot = next(
-                (candidate for candidate in available_slots if candidate["duration_minutes"] >= needed_minutes),
+                (
+                    candidate
+                    for candidate in available_slots
+                    if candidate["duration_minutes"] >= needed_minutes
+                    and cls._context_matches(task.get("context"), candidate.get("context", "flexible"))
+                ),
                 None,
             )
             if not slot:
@@ -899,10 +1098,12 @@ class EmailConstructor:
         suggestions: List[Dict],
         timestamp: datetime,
         tz_name: str,
+        task_hub_url: str,
     ) -> str:
         critical_tasks = [task for task in tasks if task.get("priority") in ["Alta", "Urgente"]]
         local_tz = get_timezone(tz_name)
         date_str = timestamp.astimezone(local_tz).strftime("%d/%m/%Y %H:%M")
+        today_events, tomorrow_events = split_events_by_day(events, local_tz)
 
         total_minutes = sum(event["duration_minutes"] for event in events)
         top_suggestion = suggestions[0] if suggestions else None
@@ -991,7 +1192,7 @@ class EmailConstructor:
             """
 
         time_blocks_html = ""
-        for event in events[:6]:
+        for event in today_events[:6]:
             start_time = event["start"].astimezone(local_tz).strftime("%H:%M")
             end_time = event["end"].astimezone(local_tz).strftime("%H:%M")
             metric = MetricasDeValor.get_metric(event["summary"], "Calendario")
@@ -1009,6 +1210,24 @@ class EmailConstructor:
                 </td>
                 <td style="padding: 12px; border-bottom: 1px solid #e0e0e0; font-size: 12px; color: #666;">
                     {metric}
+                </td>
+            </tr>
+            """
+
+        tomorrow_blocks_html = ""
+        for event in tomorrow_events[:6]:
+            start_time = event["start"].astimezone(local_tz).strftime("%H:%M")
+            end_time = event["end"].astimezone(local_tz).strftime("%H:%M")
+            tomorrow_blocks_html += f"""
+            <tr>
+                <td style="padding: 12px; border-bottom: 1px solid #cbd5e1;">
+                    <strong>{start_time}</strong> → <strong>{end_time}</strong>
+                </td>
+                <td style="padding: 12px; border-bottom: 1px solid #cbd5e1; color:#0f172a;">
+                    {event['summary']}
+                </td>
+                <td style="padding: 12px; border-bottom: 1px solid #cbd5e1; text-align: center; color:#334155;">
+                    {event['duration_minutes']} min
                 </td>
             </tr>
             """
@@ -1180,7 +1399,7 @@ class EmailConstructor:
 
                     <div class="panel">
                         <div class="section-title">Insight del dia</div>
-                        <div style="background:#ecfdf5; border:1px solid #86efac; border-radius:20px; padding:20px 22px;">
+                        <div style="background:#dcfce7; border:1px solid #4ade80; border-radius:20px; padding:20px 22px;">
                             <div style="font-size:20px; line-height:1.4; font-weight:700; color:#0f172a; margin-bottom:8px;">
                                 {daily_insight}
                             </div>
@@ -1192,14 +1411,14 @@ class EmailConstructor:
 
                     <div class="panel">
                         <div class="section-title">Sugerencia principal</div>
-                        <div style="background:linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%); border-radius:22px; padding:24px; color:#ffffff; border:1px solid #1d4ed8;">
-                            <div style="font-size:12px; text-transform:uppercase; letter-spacing:1.2px; opacity:0.8; margin-bottom:10px;">
+                        <div style="background:#0f172a; border-radius:22px; padding:24px; color:#ffffff; border:1px solid #1d4ed8;">
+                            <div style="font-size:12px; text-transform:uppercase; letter-spacing:1.2px; color:#bfdbfe; margin-bottom:10px; font-weight:700;">
                                 Hoja de ruta sugerida
                             </div>
-                            <div style="font-size:24px; line-height:1.2; font-weight:700; margin-bottom:10px;">
+                            <div style="font-size:24px; line-height:1.2; font-weight:700; margin-bottom:10px; color:#ffffff;">
                                 {top_suggestion['task_title'] if top_suggestion else 'Analizando tu flujo optimo...'}
                             </div>
-                            <div style="font-size:14px; line-height:1.6; color:rgba(255,255,255,0.84);">
+                            <div style="font-size:14px; line-height:1.6; color:#e2e8f0;">
                                 {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion['slot_duration']} min disponibles) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion['slot_duration'])} min. {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
                             </div>
                         </div>
@@ -1229,7 +1448,7 @@ class EmailConstructor:
                     </div>
 
                     <div class="panel">
-                        <div class="section-title">Agenda importada desde Google Calendar</div>
+                        <div class="section-title">Agenda de hoy</div>
                         <table>
                             <thead>
                                 <tr>
@@ -1240,7 +1459,23 @@ class EmailConstructor:
                                 </tr>
                             </thead>
                             <tbody>
-                                {time_blocks_html if time_blocks_html else '<tr><td colspan="4" style="padding: 16px; text-align:center; color:#64748b;">Sin eventos programados en las proximas 24 horas.</td></tr>'}
+                                {time_blocks_html if time_blocks_html else '<tr><td colspan="4" style="padding: 16px; text-align:center; color:#334155; background:#ffffff;">Sin eventos programados para hoy.</td></tr>'}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="panel">
+                        <div class="section-title">Agenda de mañana</div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Hora</th>
+                                    <th>Actividad</th>
+                                    <th>Duracion</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {tomorrow_blocks_html if tomorrow_blocks_html else '<tr><td colspan="3" style="padding: 16px; text-align:center; color:#334155; background:#ffffff;">No hay clases o eventos agendados para mañana dentro del horizonte actual.</td></tr>'}
                             </tbody>
                         </table>
                     </div>
@@ -1253,8 +1488,8 @@ class EmailConstructor:
                     </div>
 
                     <div style="text-align:center; margin-top:22px;">
-                        <a href="https://www.notion.so/" style="display:inline-block; background:#0f172a; color:#ffffff; text-decoration:none; font-weight:700; font-size:15px; padding:14px 22px; border-radius:14px; box-shadow:0 10px 22px rgba(15,23,42,0.15);">
-                            Abrir espacio de trabajo
+                        <a href="{task_hub_url}" style="display:inline-block; background:#0f172a; color:#ffffff; text-decoration:none; font-weight:700; font-size:15px; padding:14px 22px; border-radius:14px; box-shadow:0 10px 22px rgba(15,23,42,0.15);">
+                            Abrir Task Hub
                         </a>
                     </div>
                 </div>
@@ -1348,6 +1583,7 @@ class Asistente:
                 self.suggestions,
                 now,
                 self.config.TIMEZONE,
+                self.config.TASK_HUB_URL,
             )
 
             logger.info("Enviar email...")
