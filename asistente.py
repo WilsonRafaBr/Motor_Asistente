@@ -27,6 +27,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from dotenv import load_dotenv
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
@@ -86,6 +88,10 @@ class ConfigAsistente:
     GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
     GOOGLE_CALENDAR_IDS = os.environ.get("GOOGLE_CALENDAR_IDS")
+    GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+    GOOGLE_OAUTH_TOKEN_URI = os.environ.get("GOOGLE_OAUTH_TOKEN_URI", "https://oauth2.googleapis.com/token")
 
     NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
     NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
@@ -116,7 +122,6 @@ class ConfigAsistente:
     def validate():
         """Valida que todas las variables requeridas esten presentes."""
         required = [
-            "GOOGLE_CREDENTIALS_JSON",
             "NOTION_API_KEY",
             "NOTION_DATABASE_ID",
             "NOTION_OUTPUT_PAGE_ID",
@@ -125,6 +130,19 @@ class ConfigAsistente:
             "EMAIL_TO",
         ]
         missing = [key for key in required if not getattr(ConfigAsistente, key)]
+
+        has_service_account = bool(ConfigAsistente.GOOGLE_CREDENTIALS_JSON)
+        has_user_oauth = all(
+            [
+                ConfigAsistente.GOOGLE_OAUTH_CLIENT_ID,
+                ConfigAsistente.GOOGLE_OAUTH_CLIENT_SECRET,
+                ConfigAsistente.GOOGLE_OAUTH_REFRESH_TOKEN,
+                ConfigAsistente.GOOGLE_OAUTH_TOKEN_URI,
+            ]
+        )
+
+        if not has_service_account and not has_user_oauth:
+            missing.append("GOOGLE_AUTH (service account u OAuth refresh token)")
 
         if missing:
             logger.error("Variables de entorno faltantes: %s", ", ".join(missing))
@@ -283,16 +301,39 @@ class CalendarSourceIntelligence:
 class GoogleCalendarIntegration:
     """Obtiene eventos de Google Calendar para las proximas 24 horas."""
 
-    def __init__(self, credentials_json: str):
+    CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+    def __init__(
+        self,
+        credentials_json: Optional[str] = None,
+        oauth_client_id: Optional[str] = None,
+        oauth_client_secret: Optional[str] = None,
+        oauth_refresh_token: Optional[str] = None,
+        oauth_token_uri: Optional[str] = None,
+    ):
         try:
-            credentials_dict = json.loads(credentials_json)
-            self.credentials = Credentials.from_service_account_info(
-                credentials_dict,
-                scopes=["https://www.googleapis.com/auth/calendar.readonly"],
-            )
+            if oauth_client_id and oauth_client_secret and oauth_refresh_token and oauth_token_uri:
+                self.credentials = UserCredentials(
+                    token=None,
+                    refresh_token=oauth_refresh_token,
+                    token_uri=oauth_token_uri,
+                    client_id=oauth_client_id,
+                    client_secret=oauth_client_secret,
+                    scopes=self.CALENDAR_SCOPES,
+                )
+                self.credentials.refresh(GoogleAuthRequest())
+                auth_mode = "oauth_user"
+            else:
+                credentials_dict = json.loads(credentials_json)
+                self.credentials = Credentials.from_service_account_info(
+                    credentials_dict,
+                    scopes=self.CALENDAR_SCOPES,
+                )
+                auth_mode = "service_account"
+
             self.service = build("calendar", "v3", credentials=self.credentials)
             self.last_calendar_snapshot: List[Dict] = []
-            logger.info("Google Calendar autenticado")
+            logger.info("Google Calendar autenticado (%s)", auth_mode)
         except Exception as exc:
             logger.error("Error autenticando Google Calendar: %s", exc)
             raise
@@ -541,6 +582,7 @@ class NotionIntegration:
         today = datetime.now().date()
         status = self._normalize_label(task.get("status", ""))
         due_date = task.get("due_date")
+        priority = self._normalize_label(task.get("priority", ""))
 
         completed_aliases = {"completado", "completed", "done", "hecho", "listo", "finalizado"}
         if status in completed_aliases:
@@ -558,6 +600,10 @@ class NotionIntegration:
             return True, "incluida: vencida"
         if due == today:
             return True, "incluida: vence hoy"
+        if due <= today + timedelta(days=3):
+            return True, f"incluida: proxima ventana ({due.isoformat()})"
+        if priority in {"alta", "urgente", "high", "critical"}:
+            return True, f"incluida: prioridad alta aunque vence despues ({due.isoformat()})"
         return False, f"descartada: vence mas adelante ({due.isoformat()})"
 
     def _query_all_results(self, data_source_id: str, payload: Dict) -> List[Dict]:
@@ -1869,6 +1915,10 @@ class DiagnosticReporter:
     @staticmethod
     def log(report: Dict):
         logger.info("=== DIAGNOSTICO: CALENDARIOS DETECTADOS ===")
+        if not report.get("calendar_snapshot"):
+            logger.warning(
+                "No se detectaron calendarios visibles. Si estas usando service account, probablemente no tiene calendarios compartidos. Para modo producto, conviene OAuth de usuario."
+            )
         for calendar in report.get("calendar_snapshot", []):
             logger.info(
                 "calendar=%s | type=%s | primary=%s | score=%s",
@@ -1879,6 +1929,8 @@ class DiagnosticReporter:
             )
 
         logger.info("=== DIAGNOSTICO: EVENTOS POR CALENDARIO ===")
+        if not report.get("events_by_calendar"):
+            logger.warning("No se registraron eventos en el horizonte consultado.")
         for name, stats in report.get("events_by_calendar", {}).items():
             logger.info(
                 "calendar=%s | type=%s | hoy=%s | manana=%s",
@@ -1942,7 +1994,13 @@ class Asistente:
                 return 1
 
             logger.info("Obtener eventos de Google Calendar...")
-            calendar = GoogleCalendarIntegration(self.config.GOOGLE_CREDENTIALS_JSON)
+            calendar = GoogleCalendarIntegration(
+                credentials_json=self.config.GOOGLE_CREDENTIALS_JSON,
+                oauth_client_id=self.config.GOOGLE_OAUTH_CLIENT_ID,
+                oauth_client_secret=self.config.GOOGLE_OAUTH_CLIENT_SECRET,
+                oauth_refresh_token=self.config.GOOGLE_OAUTH_REFRESH_TOKEN,
+                oauth_token_uri=self.config.GOOGLE_OAUTH_TOKEN_URI,
+            )
             self.events = calendar.get_events_horizon(
                 self.config.get_calendar_ids(),
                 hours=48,
