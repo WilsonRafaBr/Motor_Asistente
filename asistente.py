@@ -171,11 +171,11 @@ class GoogleCalendarIntegration:
             logger.error("Error autenticando Google Calendar: %s", exc)
             raise
 
-    def get_events_24h(self, calendar_id: str = "primary") -> List[Dict]:
-        """Obtiene todos los eventos de las proximas 24 horas."""
+    def get_events_horizon(self, calendar_id: str = "primary", hours: int = 48) -> List[Dict]:
+        """Obtiene todos los eventos del horizonte solicitado."""
         try:
             now = datetime.now(timezone.utc)
-            end_time = now + timedelta(days=1)
+            end_time = now + timedelta(hours=hours)
 
             events_result = (
                 self.service.events()
@@ -210,7 +210,7 @@ class GoogleCalendarIntegration:
                         }
                     )
 
-            logger.info("%s eventos encontrados en proximas 24h", len(events))
+            logger.info("%s eventos encontrados en proximas %sh", len(events), hours)
             return events
         except Exception as exc:
             logger.error("Error obteniendo eventos: %s", exc)
@@ -413,6 +413,18 @@ class NotionIntegration:
             ["select", "status", "multi_select"],
             ["Category", "Categoria", "Area"],
         )
+        duration_name, duration_prop = self._find_property(
+            properties,
+            ["number"],
+            [
+                "Duracion estimada",
+                "Duracion",
+                "Estimated Duration",
+                "Estimate",
+                "Minutos",
+                "Tiempo estimado",
+            ],
+        )
 
         title_items = props.get(title_name or "", {}).get("title", [])
         title_text = self._extract_plain_text(title_items) or "Sin titulo"
@@ -456,6 +468,12 @@ class NotionIntegration:
                 items = category_data.get("multi_select") or []
                 category_value = items[0]["name"] if items else "General"
 
+        estimated_minutes = None
+        if duration_name and duration_prop:
+            estimated_minutes = props.get(duration_name, {}).get("number")
+            if estimated_minutes is not None:
+                estimated_minutes = int(estimated_minutes)
+
         return {
             "id": result["id"],
             "title": title_text,
@@ -463,6 +481,7 @@ class NotionIntegration:
             "due_date": due_value,
             "priority": priority_value,
             "category": category_value,
+            "estimated_minutes": estimated_minutes,
         }
 
     def query_database(self, database_id: str) -> List[Dict]:
@@ -659,6 +678,37 @@ class MetricasDeValor:
         return MetricasDeValor.KEYWORDS_MAPPING["general"]["metric"]
 
 
+class ExplicadorDeSugerencias:
+    """Construye razones mas concretas y menos genericas para cada recomendacion."""
+
+    @staticmethod
+    def build_reason(task: Dict, slot: Dict) -> str:
+        priority = task.get("priority", "Normal")
+        due_date = task.get("due_date")
+        estimated = task.get("estimated_minutes")
+
+        reasons = []
+
+        if priority in {"Urgente", "Alta"}:
+            reasons.append(f"prioridad {priority.lower()}")
+
+        if due_date:
+            reasons.append(f"vence el {due_date[:10]}")
+
+        if estimated:
+            reasons.append(f"requiere {estimated} min estimados")
+
+        if slot["duration_minutes"] >= 180:
+            reasons.append("bloque largo con pocas interrupciones")
+        elif slot["duration_minutes"] >= 90:
+            reasons.append("bloque suficiente para avanzar sin cambiar de contexto")
+        else:
+            reasons.append("bloque corto util para destrabar una parte concreta")
+
+        base = ", ".join(reasons[:3])
+        return f"Se recomienda este espacio porque combina {base}."
+
+
 class MotorDeSugerencias:
     """Detecta huecos y propone tareas dentro de ellos."""
 
@@ -760,7 +810,10 @@ class MotorDeSugerencias:
         suggestions = []
 
         for task in ordered_tasks:
-            needed_minutes = cls.DEFAULT_TASK_MINUTES.get(task.get("priority", "Normal"), 45)
+            needed_minutes = task.get("estimated_minutes") or cls.DEFAULT_TASK_MINUTES.get(
+                task.get("priority", "Normal"),
+                45,
+            )
             slot = next(
                 (candidate for candidate in available_slots if candidate["duration_minutes"] >= needed_minutes),
                 None,
@@ -768,13 +821,14 @@ class MotorDeSugerencias:
             if not slot:
                 continue
 
-            reason = MetricasDeValor.get_metric(task["title"], task.get("category", ""))
+            reason = ExplicadorDeSugerencias.build_reason(task, slot)
             suggestions.append(
                 {
                     "task_title": task["title"],
                     "priority": task.get("priority", "Normal"),
                     "slot_label": slot["label"],
                     "slot_duration": slot["duration_minutes"],
+                    "required_minutes": needed_minutes,
                     "reason": reason,
                 }
             )
@@ -798,7 +852,8 @@ class EmailConstructor:
             longest_slot = max(free_slots, key=lambda slot: slot["duration_minutes"])
             return (
                 f"Hoy tienes una ventana clara de {longest_slot['duration_minutes']} minutos. "
-                f"El mejor movimiento es enfocar primero '{best['task_title']}' en el bloque {best['slot_label']}."
+                f"El mejor movimiento es enfocar primero '{best['task_title']}' en el bloque {best['slot_label']}, "
+                f"alineado con su necesidad real de {best.get('required_minutes', best['slot_duration'])} minutos."
             )
 
         if free_slots:
@@ -875,7 +930,10 @@ class EmailConstructor:
                             {suggestion['task_title']}
                         </div>
                         <div style="font-size:14px; color:#334155; margin-bottom:8px;">
-                            Recomendado para {suggestion['slot_label']} ({suggestion['slot_duration']} min)
+                            Recomendado para {suggestion['slot_label']} ({suggestion['slot_duration']} min disponibles)
+                        </div>
+                        <div style="font-size:13px; color:#0f172a; margin-bottom:8px; font-weight:600;">
+                            Duracion estimada de la tarea: {suggestion.get('required_minutes', 'N/D')} min
                         </div>
                         <div style="font-size:13px; color:#64748b; line-height:1.6;">
                             {suggestion['reason']}
@@ -890,7 +948,7 @@ class EmailConstructor:
             slot_kind = "Bloque profundo" if slot["duration_minutes"] >= 90 else "Bloque rapido"
             gaps_cards_html += f"""
             <td style="padding:0 8px 12px 8px; vertical-align:top;">
-                <div style="background:#fdfaf3; border:1px solid #fde7b0; border-radius:18px; padding:18px;">
+                <div style="background:#fff7ed; border:1px solid #fdba74; border-radius:18px; padding:18px;">
                     <div style="font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:1px; color:#3b82f6; margin-bottom:8px;">
                         {slot_kind}
                     </div>
@@ -917,7 +975,7 @@ class EmailConstructor:
             tasks_html += f"""
             <tr>
                 <td style="padding: 0 0 12px 0;">
-                    <div style="background:#f6f7fb; border:1px solid #e5e7eb; border-radius:16px; padding:16px 18px;">
+                    <div style="background:#f5f3ff; border:1px solid #c4b5fd; border-radius:16px; padding:16px 18px;">
                         <div style="font-size:16px; font-weight:700; color:#0f172a; margin-bottom:6px;">
                             {task['title']}
                         </div>
@@ -966,7 +1024,7 @@ class EmailConstructor:
                     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
                     line-height: 1.6;
                     color: #0f172a;
-                    background: linear-gradient(180deg, #eef4ff 0%, #f8fafc 48%, #eef2ff 100%);
+                    background: linear-gradient(180deg, #eaf4ff 0%, #f8fafc 48%, #f4f0ff 100%);
                     margin: 0;
                     padding: 0;
                 }}
@@ -981,8 +1039,8 @@ class EmailConstructor:
                     padding: 28px 18px 40px 18px;
                 }}
                 .hero {{
-                    background: radial-gradient(circle at top left, #dbeafe 0%, #ffffff 38%, #f8fafc 100%);
-                    border: 1px solid #dbeafe;
+                    background: radial-gradient(circle at top left, #cfe7ff 0%, #ffffff 38%, #f8fafc 100%);
+                    border: 1px solid #bfdbfe;
                     border-radius: 28px;
                     padding: 34px 30px 28px 30px;
                     box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
@@ -1022,8 +1080,8 @@ class EmailConstructor:
                     margin: 0 0 12px 0;
                 }}
                 .panel {{
-                    background: rgba(255,255,255,0.88);
-                    border: 1px solid #e2e8f0;
+                    background: rgba(255,255,255,0.96);
+                    border: 1px solid #cbd5e1;
                     border-radius: 24px;
                     padding: 24px;
                     box-shadow: 0 12px 30px rgba(15, 23, 42, 0.05);
@@ -1048,8 +1106,8 @@ class EmailConstructor:
                     font-size: 12px;
                 }}
                 .metric-card {{
-                    background: rgba(255,255,255,0.74);
-                    border: 1px solid #e2e8f0;
+                    background: #ffffff;
+                    border: 1px solid #cbd5e1;
                     border-radius: 18px;
                     padding: 18px;
                 }}
@@ -1122,7 +1180,7 @@ class EmailConstructor:
 
                     <div class="panel">
                         <div class="section-title">Insight del dia</div>
-                        <div style="background:#eef7f2; border:1px solid #cfe8d7; border-radius:20px; padding:20px 22px;">
+                        <div style="background:#ecfdf5; border:1px solid #86efac; border-radius:20px; padding:20px 22px;">
                             <div style="font-size:20px; line-height:1.4; font-weight:700; color:#0f172a; margin-bottom:8px;">
                                 {daily_insight}
                             </div>
@@ -1134,7 +1192,7 @@ class EmailConstructor:
 
                     <div class="panel">
                         <div class="section-title">Sugerencia principal</div>
-                        <div style="background:linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%); border-radius:22px; padding:24px; color:#ffffff;">
+                        <div style="background:linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%); border-radius:22px; padding:24px; color:#ffffff; border:1px solid #1d4ed8;">
                             <div style="font-size:12px; text-transform:uppercase; letter-spacing:1.2px; opacity:0.8; margin-bottom:10px;">
                                 Hoja de ruta sugerida
                             </div>
@@ -1142,7 +1200,7 @@ class EmailConstructor:
                                 {top_suggestion['task_title'] if top_suggestion else 'Analizando tu flujo optimo...'}
                             </div>
                             <div style="font-size:14px; line-height:1.6; color:rgba(255,255,255,0.84);">
-                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion['slot_duration']} min). {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
+                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion['slot_duration']} min disponibles) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion['slot_duration'])} min. {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
                             </div>
                         </div>
                     </div>
@@ -1158,15 +1216,15 @@ class EmailConstructor:
                         <div class="section-title">Disponibilidad del dia</div>
                         <table role="presentation">
                             <tr>
-                                {gaps_cards_html if gaps_cards_html else '<td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">Sin bloques libres detectados hoy.</div></td>'}
-                            </tr>
-                        </table>
-                    </div>
+                            {gaps_cards_html if gaps_cards_html else '<td><div style="background:#fff7ed; border:1px dashed #fdba74; border-radius:18px; padding:20px; color:#7c2d12;">Sin bloques libres detectados hoy.</div></td>'}
+                        </tr>
+                    </table>
+                </div>
 
                     <div class="panel">
                         <div class="section-title">The Big Three</div>
                         <table role="presentation">
-                            {tasks_html if tasks_html else '<tr><td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">No hay objetivos prioritarios pendientes para hoy.</div></td></tr>'}
+                            {tasks_html if tasks_html else '<tr><td><div style="background:#f5f3ff; border:1px dashed #a78bfa; border-radius:18px; padding:20px; color:#5b21b6;">No hay objetivos prioritarios pendientes para hoy.</div></td></tr>'}
                         </table>
                     </div>
 
@@ -1189,7 +1247,7 @@ class EmailConstructor:
 
                     <div class="panel">
                         <div class="section-title">Anticipacion para mañana</div>
-                        <div style="background:#f4f1ff; border:1px solid #ddd6fe; border-radius:20px; padding:18px 20px; font-size:14px; color:#334155;">
+                        <div style="background:#f5f3ff; border:1px solid #c4b5fd; border-radius:20px; padding:18px 20px; font-size:14px; color:#334155;">
                             {tomorrow_note}
                         </div>
                     </div>
@@ -1264,7 +1322,7 @@ class Asistente:
 
             logger.info("Obtener eventos de Google Calendar...")
             calendar = GoogleCalendarIntegration(self.config.GOOGLE_CREDENTIALS_JSON)
-            self.events = calendar.get_events_24h(self.config.GOOGLE_CALENDAR_ID)
+            self.events = calendar.get_events_horizon(self.config.GOOGLE_CALENDAR_ID, hours=48)
 
             logger.info("Obtener tareas de Notion...")
             notion = NotionIntegration(
