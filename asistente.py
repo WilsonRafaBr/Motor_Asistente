@@ -787,6 +787,56 @@ class EmailConstructor:
     """Construye email HTML con sugerencias."""
 
     @staticmethod
+    def _build_daily_insight(
+        tasks: List[Dict],
+        free_slots: List[Dict],
+        suggestions: List[Dict],
+    ) -> str:
+        """Genera una frase breve con valor agregado."""
+        if suggestions and free_slots:
+            best = suggestions[0]
+            longest_slot = max(free_slots, key=lambda slot: slot["duration_minutes"])
+            return (
+                f"Hoy tienes una ventana clara de {longest_slot['duration_minutes']} minutos. "
+                f"El mejor movimiento es enfocar primero '{best['task_title']}' en el bloque {best['slot_label']}."
+            )
+
+        if free_slots:
+            longest_slot = max(free_slots, key=lambda slot: slot["duration_minutes"])
+            return (
+                f"Tu mayor activo hoy es un bloque libre de {longest_slot['duration_minutes']} minutos "
+                f"entre {longest_slot['label']}. Conviene reservarlo para trabajo de alta concentracion."
+            )
+
+        if tasks:
+            return (
+                "Hoy el sistema detecta poco margen libre. La prioridad no es agregar mas trabajo, "
+                "sino proteger energia y ejecutar solo lo esencial."
+            )
+
+        return (
+            "Tu dia luce liviano. Este es un buen momento para adelantar una tarea importante antes "
+            "de que se acumule carga el resto de la semana."
+        )
+
+    @staticmethod
+    def _build_tomorrow_note(events: List[Dict], tz) -> str:
+        """Genera una nota corta de anticipacion para el dia siguiente."""
+        tomorrow = datetime.now(tz).date() + timedelta(days=1)
+        tomorrow_events = [
+            event for event in events
+            if event["start"].astimezone(tz).date() == tomorrow
+        ]
+
+        if len(tomorrow_events) >= 5:
+            return f"Mañana se perfila como un dia cargado: ya hay {len(tomorrow_events)} eventos en agenda. Conviene cerrar hoy con descanso y dejar claro el primer bloque de accion."
+        if len(tomorrow_events) >= 2:
+            return f"Mañana ya tiene {len(tomorrow_events)} compromisos visibles. Vale la pena dejar preparada desde hoy tu tarea de apertura."
+        if len(tomorrow_events) == 1:
+            return "Mañana empieza con baja friccion. Si dejas una prioridad bien definida hoy, puedes entrar en ritmo rapido."
+        return "Mañana todavia luce flexible. Eso te da margen para proteger un bloque profundo desde temprano."
+
+    @staticmethod
     def build_html(
         tasks: List[Dict],
         events: List[Dict],
@@ -801,6 +851,9 @@ class EmailConstructor:
 
         total_minutes = sum(event["duration_minutes"] for event in events)
         top_suggestion = suggestions[0] if suggestions else None
+        daily_insight = EmailConstructor._build_daily_insight(tasks, free_slots, suggestions)
+        tomorrow_note = EmailConstructor._build_tomorrow_note(events, local_tz)
+        big_three = (critical_tasks or tasks)[:3]
 
         suggestion_cards_html = ""
         for suggestion in suggestions[:4]:
@@ -814,7 +867,7 @@ class EmailConstructor:
             suggestion_cards_html += f"""
             <tr>
                 <td style="padding-bottom: 14px;">
-                    <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:18px; padding:20px 22px;">
+                    <div style="background:#f8fbff; border:1px solid #dbeafe; border-radius:18px; padding:20px 22px;">
                         <div style="font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color:{priority_color}; margin-bottom:10px;">
                             {priority}
                         </div>
@@ -834,11 +887,12 @@ class EmailConstructor:
 
         gaps_cards_html = ""
         for slot in free_slots[:4]:
+            slot_kind = "Bloque profundo" if slot["duration_minutes"] >= 90 else "Bloque rapido"
             gaps_cards_html += f"""
             <td style="padding:0 8px 12px 8px; vertical-align:top;">
-                <div style="background:linear-gradient(180deg, #ffffff 0%, #f8fafc 100%); border:1px solid #dbeafe; border-radius:18px; padding:18px;">
+                <div style="background:#fdfaf3; border:1px solid #fde7b0; border-radius:18px; padding:18px;">
                     <div style="font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:1px; color:#3b82f6; margin-bottom:8px;">
-                        Bloque libre
+                        {slot_kind}
                     </div>
                     <div style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:6px;">
                         {slot['label']}
@@ -851,7 +905,7 @@ class EmailConstructor:
             """
 
         tasks_html = ""
-        for task in critical_tasks[:4]:
+        for task in big_three:
             priority = task.get("priority", "Normal")
             priority_color = {
                 "Urgente": "#ef4444",
@@ -863,7 +917,7 @@ class EmailConstructor:
             tasks_html += f"""
             <tr>
                 <td style="padding: 0 0 12px 0;">
-                    <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:16px; padding:16px 18px;">
+                    <div style="background:#f6f7fb; border:1px solid #e5e7eb; border-radius:16px; padding:16px 18px;">
                         <div style="font-size:16px; font-weight:700; color:#0f172a; margin-bottom:6px;">
                             {task['title']}
                         </div>
@@ -968,7 +1022,7 @@ class EmailConstructor:
                     margin: 0 0 12px 0;
                 }}
                 .panel {{
-                    background: rgba(255,255,255,0.84);
+                    background: rgba(255,255,255,0.88);
                     border: 1px solid #e2e8f0;
                     border-radius: 24px;
                     padding: 24px;
@@ -1012,6 +1066,25 @@ class EmailConstructor:
                     text-transform: uppercase;
                     letter-spacing: 1px;
                 }}
+                @media only screen and (max-width: 640px) {{
+                    .shell {{
+                        padding: 14px 10px 28px 10px !important;
+                    }}
+                    .hero {{
+                        padding: 24px 18px 20px 18px !important;
+                        border-radius: 22px !important;
+                    }}
+                    .hero h1 {{
+                        font-size: 28px !important;
+                    }}
+                    .panel {{
+                        padding: 18px !important;
+                        border-radius: 20px !important;
+                    }}
+                    .metric-card {{
+                        padding: 14px !important;
+                    }}
+                }}
             </style>
         </head>
         <body>
@@ -1048,6 +1121,18 @@ class EmailConstructor:
                     </div>
 
                     <div class="panel">
+                        <div class="section-title">Insight del dia</div>
+                        <div style="background:#eef7f2; border:1px solid #cfe8d7; border-radius:20px; padding:20px 22px;">
+                            <div style="font-size:20px; line-height:1.4; font-weight:700; color:#0f172a; margin-bottom:8px;">
+                                {daily_insight}
+                            </div>
+                            <div style="font-size:13px; color:#64748b;">
+                                El valor de Asistente no es recordarte tareas: es señalar el mejor momento para ejecutarlas.
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="panel">
                         <div class="section-title">Sugerencia principal</div>
                         <div style="background:linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%); border-radius:22px; padding:24px; color:#ffffff;">
                             <div style="font-size:12px; text-transform:uppercase; letter-spacing:1.2px; opacity:0.8; margin-bottom:10px;">
@@ -1079,9 +1164,9 @@ class EmailConstructor:
                     </div>
 
                     <div class="panel">
-                        <div class="section-title">Objetivos criticos</div>
+                        <div class="section-title">The Big Three</div>
                         <table role="presentation">
-                            {tasks_html if tasks_html else '<tr><td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">No hay tareas criticas pendientes para hoy.</div></td></tr>'}
+                            {tasks_html if tasks_html else '<tr><td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">No hay objetivos prioritarios pendientes para hoy.</div></td></tr>'}
                         </table>
                     </div>
 
@@ -1100,6 +1185,19 @@ class EmailConstructor:
                                 {time_blocks_html if time_blocks_html else '<tr><td colspan="4" style="padding: 16px; text-align:center; color:#64748b;">Sin eventos programados en las proximas 24 horas.</td></tr>'}
                             </tbody>
                         </table>
+                    </div>
+
+                    <div class="panel">
+                        <div class="section-title">Anticipacion para mañana</div>
+                        <div style="background:#f4f1ff; border:1px solid #ddd6fe; border-radius:20px; padding:18px 20px; font-size:14px; color:#334155;">
+                            {tomorrow_note}
+                        </div>
+                    </div>
+
+                    <div style="text-align:center; margin-top:22px;">
+                        <a href="https://www.notion.so/" style="display:inline-block; background:#0f172a; color:#ffffff; text-decoration:none; font-weight:700; font-size:15px; padding:14px 22px; border-radius:14px; box-shadow:0 10px 22px rgba(15,23,42,0.15);">
+                            Abrir espacio de trabajo
+                        </a>
                     </div>
                 </div>
                 <div class="footer">
