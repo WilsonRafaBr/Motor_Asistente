@@ -2180,7 +2180,7 @@ class Asistente:
             )
             created_events: List[Dict] = []
             for suggestion in self.suggestions:
-                title = f"[ZENTRUM] {suggestion['task_title']}"
+                title = f"[Asistente] {suggestion['task_title']}"
                 description = (
                     f"Categoría: {suggestion['category']}\n"
                     f"Prioridad: {suggestion['priority']}\n"
