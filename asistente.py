@@ -1476,6 +1476,9 @@ class MotorDeSugerencias:
                 continue
 
             reason = ExplicadorDeSugerencias.build_reason(task, slot)
+            scheduled_start = slot["start"]
+            scheduled_end = scheduled_start + timedelta(minutes=needed_minutes)
+            remaining_minutes = int((slot["end"] - scheduled_end).total_seconds() / 60)
             suggestions.append(
                 {
                     "task_id": task["id"],
@@ -1483,16 +1486,28 @@ class MotorDeSugerencias:
                     "category": task.get("category", "General"),
                     "priority": task.get("priority", "Normal"),
                     "context": task.get("context"),
-                    "slot_label": slot["label"],
-                    "slot_start": slot["start"].isoformat(),
-                    "slot_end": slot["end"].isoformat(),
-                    "slot_duration_minutes": slot["duration_minutes"],
-                    "slot_duration": slot["duration_minutes"],
+                    "slot_label": cls._slot_label(scheduled_start, scheduled_end),
+                    "slot_start": scheduled_start.isoformat(),
+                    "slot_end": scheduled_end.isoformat(),
+                    "slot_duration_minutes": needed_minutes,
+                    "slot_duration": needed_minutes,
+                    "available_window_minutes": slot["duration_minutes"],
                     "required_minutes": needed_minutes,
                     "reason": reason,
                 }
             )
             available_slots.remove(slot)
+            if remaining_minutes >= cls.MIN_SLOT_MINUTES:
+                available_slots.append(
+                    {
+                        "start": scheduled_end,
+                        "end": slot["end"],
+                        "duration_minutes": remaining_minutes,
+                        "label": cls._slot_label(scheduled_end, slot["end"]),
+                        "context": slot.get("context", "flexible"),
+                    }
+                )
+                available_slots.sort(key=lambda candidate: candidate["start"])
 
         return suggestions, unscheduled
 
@@ -1592,7 +1607,7 @@ class EmailConstructor:
                             {suggestion['task_title']}
                         </div>
                         <div style="font-size:14px; color:#334155; margin-bottom:8px;">
-                            Recomendado para {suggestion['slot_label']} ({suggestion.get('slot_duration_minutes', suggestion['slot_duration'])} min disponibles)
+                            Recomendado para {suggestion['slot_label']} ({suggestion.get('slot_duration_minutes', suggestion['slot_duration'])} min programados)
                         </div>
                         <div style="font-size:13px; color:#0f172a; margin-bottom:8px; font-weight:600;">
                             Duracion estimada de la tarea: {suggestion.get('required_minutes', 'N/D')} min
@@ -1896,7 +1911,7 @@ class EmailConstructor:
                                 {top_suggestion['task_title'] if top_suggestion else 'Analizando tu flujo optimo...'}
                             </div>
                             <div style="font-size:14px; line-height:1.6; color:#e2e8f0;">
-                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration'])} min disponibles) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration']))} min. {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
+                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration'])} min programados) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration']))} min. {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
                             </div>
                         </div>
                     </div>
@@ -2165,7 +2180,7 @@ class Asistente:
             )
             created_events: List[Dict] = []
             for suggestion in self.suggestions:
-                title = f"[Asistente] {suggestion['task_title']}"
+                title = f"[ZENTRUM] {suggestion['task_title']}"
                 description = (
                     f"Categoría: {suggestion['category']}\n"
                     f"Prioridad: {suggestion['priority']}\n"
