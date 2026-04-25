@@ -312,6 +312,7 @@ class GoogleCalendarIntegration:
     """Obtiene eventos de Google Calendar para las proximas 24 horas."""
 
     CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+    CALENDAR_READONLY_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
     def __init__(
         self,
@@ -323,16 +324,12 @@ class GoogleCalendarIntegration:
     ):
         try:
             if oauth_client_id and oauth_client_secret and oauth_refresh_token and oauth_token_uri:
-                self.credentials = UserCredentials(
-                    token=None,
-                    refresh_token=oauth_refresh_token,
-                    token_uri=oauth_token_uri,
-                    client_id=oauth_client_id,
-                    client_secret=oauth_client_secret,
-                    scopes=self.CALENDAR_SCOPES,
+                self.credentials, auth_mode = self._build_oauth_credentials(
+                    oauth_client_id=oauth_client_id,
+                    oauth_client_secret=oauth_client_secret,
+                    oauth_refresh_token=oauth_refresh_token,
+                    oauth_token_uri=oauth_token_uri,
                 )
-                self.credentials.refresh(GoogleAuthRequest())
-                auth_mode = "oauth_user"
             else:
                 credentials_dict = json.loads(credentials_json)
                 self.credentials = Credentials.from_service_account_info(
@@ -347,6 +344,56 @@ class GoogleCalendarIntegration:
         except Exception as exc:
             logger.error("Error autenticando Google Calendar: %s", exc)
             raise
+
+    def _build_oauth_credentials(
+        self,
+        oauth_client_id: str,
+        oauth_client_secret: str,
+        oauth_refresh_token: str,
+        oauth_token_uri: str,
+    ) -> Tuple[UserCredentials, str]:
+        """Construye credenciales OAuth con fallback al scope ya concedido."""
+        try:
+            credentials = UserCredentials(
+                token=None,
+                refresh_token=oauth_refresh_token,
+                token_uri=oauth_token_uri,
+                client_id=oauth_client_id,
+                client_secret=oauth_client_secret,
+                scopes=self.CALENDAR_SCOPES,
+            )
+            credentials.refresh(GoogleAuthRequest())
+            return credentials, "oauth_user"
+        except Exception as exc:
+            if "invalid_scope" not in str(exc):
+                raise
+
+            logger.warning(
+                "El refresh token OAuth no acepta el scope calendar durante el refresh. "
+                "Se reintentara con los scopes originalmente concedidos."
+            )
+            credentials = UserCredentials(
+                token=None,
+                refresh_token=oauth_refresh_token,
+                token_uri=oauth_token_uri,
+                client_id=oauth_client_id,
+                client_secret=oauth_client_secret,
+            )
+            credentials.refresh(GoogleAuthRequest())
+
+            granted_scopes = list(
+                getattr(credentials, "granted_scopes", None)
+                or getattr(credentials, "scopes", None)
+                or []
+            )
+            if self.CALENDAR_SCOPES[0] not in granted_scopes:
+                logger.warning(
+                    "El token OAuth actual no incluye permiso de escritura sobre Google Calendar. "
+                    "La lectura seguira funcionando, pero para crear eventos debes regenerar el refresh token "
+                    "con el scope https://www.googleapis.com/auth/calendar."
+                )
+
+            return credentials, "oauth_user_existing_scope"
 
     @staticmethod
     def _normalize_event_datetime(value: str, is_end: bool = False) -> datetime:
@@ -448,6 +495,11 @@ class GoogleCalendarIntegration:
             logger.info("Evento creado en Google Calendar: %s", created_event.get("id"))
             return created_event
         except Exception as exc:
+            if "insufficient authentication scopes" in str(exc).lower():
+                logger.error(
+                    "No se pudo crear el evento porque el token OAuth actual no tiene scope de escritura. "
+                    "Regenera GOOGLE_OAUTH_REFRESH_TOKEN con acceso a Google Calendar."
+                )
             logger.error("Error creando evento en Google Calendar: %s", exc)
             return None
 
