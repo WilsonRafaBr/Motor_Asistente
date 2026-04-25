@@ -1311,49 +1311,100 @@ class MotorDeSugerencias:
         return sessions
 
     @classmethod
-    def _break_minutes_for_slot(cls, slot_duration_minutes: int, needed_minutes: int, session_count: int) -> int:
-        """Distribuye pausas solo si el hueco tiene margen suficiente."""
-        if session_count <= 1:
-            return 0
-
-        extra_capacity = max(slot_duration_minutes - needed_minutes, 0)
-        pause_count = session_count - 1
-        return min(cls.MAX_BREAK_BETWEEN_BLOCKS_MINUTES, extra_capacity // pause_count)
-
-    @classmethod
-    def _build_scheduled_sessions(
+    def _allocate_task_sessions(
         cls,
-        slot: Dict,
+        available_slots: List[Dict],
+        task_context: Optional[str],
         needed_minutes: int,
-    ) -> Tuple[List[Dict], int]:
-        """Construye sesiones concretas dentro del hueco seleccionado."""
-        session_lengths = cls._build_session_lengths(needed_minutes)
-        break_minutes = cls._break_minutes_for_slot(
-            slot["duration_minutes"],
-            needed_minutes,
-            len(session_lengths),
-        )
+    ) -> List[Dict]:
+        """Agenda el mayor avance posible de una tarea a traves de uno o varios huecos."""
+        remaining_minutes = needed_minutes
+        scheduled_sessions: List[Dict] = []
 
-        scheduled_sessions = []
-        cursor = slot["start"]
-        for index, session_minutes in enumerate(session_lengths, start=1):
-            session_start = cursor
-            session_end = session_start + timedelta(minutes=session_minutes)
-            scheduled_sessions.append(
-                {
-                    "slot_start": session_start.isoformat(),
-                    "slot_end": session_end.isoformat(),
-                    "slot_label": cls._slot_label(session_start, session_end),
-                    "slot_duration_minutes": session_minutes,
-                    "session_index": index,
-                    "session_total": len(session_lengths),
-                }
+        while remaining_minutes > 0:
+            matching_slots = sorted(
+                [
+                    candidate
+                    for candidate in available_slots
+                    if cls._context_matches(task_context, candidate.get("context", "flexible"))
+                ],
+                key=lambda candidate: candidate["start"],
             )
-            cursor = session_end
-            if index < len(session_lengths):
-                cursor = cursor + timedelta(minutes=break_minutes)
+            if not matching_slots:
+                break
 
-        return scheduled_sessions, break_minutes
+            slot = matching_slots[0]
+            available_slots.remove(slot)
+
+            cursor = slot["start"]
+            remaining_capacity = slot["duration_minutes"]
+            sessions_in_current_slot = 0
+
+            while remaining_minutes > 0 and remaining_capacity >= cls.MIN_SLOT_MINUTES:
+                break_before_minutes = 0
+                if sessions_in_current_slot > 0:
+                    preferred_break = min(
+                        cls.MAX_BREAK_BETWEEN_BLOCKS_MINUTES,
+                        remaining_capacity - cls.MIN_SLOT_MINUTES,
+                    )
+                    if preferred_break <= 0:
+                        break
+                    cursor = cursor + timedelta(minutes=preferred_break)
+                    remaining_capacity -= preferred_break
+                    break_before_minutes = preferred_break
+
+                session_minutes = min(
+                    cls.MAX_FOCUS_BLOCK_MINUTES,
+                    remaining_minutes,
+                    remaining_capacity,
+                )
+                if session_minutes < cls.MIN_SLOT_MINUTES and remaining_minutes > cls.MIN_SLOT_MINUTES:
+                    if break_before_minutes:
+                        cursor = cursor - timedelta(minutes=break_before_minutes)
+                        remaining_capacity += break_before_minutes
+                    break
+
+                session_start = cursor
+                session_end = session_start + timedelta(minutes=session_minutes)
+                scheduled_sessions.append(
+                    {
+                        "slot_start": session_start.isoformat(),
+                        "slot_end": session_end.isoformat(),
+                        "slot_label": cls._slot_label(session_start, session_end),
+                        "slot_duration_minutes": session_minutes,
+                        "break_before_minutes": break_before_minutes,
+                    }
+                )
+
+                cursor = session_end
+                remaining_capacity -= session_minutes
+                remaining_minutes -= session_minutes
+                sessions_in_current_slot += 1
+
+                if remaining_minutes <= 0:
+                    break
+
+            if remaining_capacity >= cls.MIN_SLOT_MINUTES:
+                available_slots.append(
+                    {
+                        "start": cursor,
+                        "end": slot["end"],
+                        "duration_minutes": remaining_capacity,
+                        "label": cls._slot_label(cursor, slot["end"]),
+                        "context": slot.get("context", "flexible"),
+                    }
+                )
+                available_slots.sort(key=lambda candidate: candidate["start"])
+
+            if sessions_in_current_slot == 0:
+                break
+
+        session_total = len(scheduled_sessions)
+        for index, session in enumerate(scheduled_sessions, start=1):
+            session["session_index"] = index
+            session["session_total"] = session_total
+
+        return scheduled_sessions
 
     @classmethod
     def find_free_slots(
@@ -1507,25 +1558,12 @@ class MotorDeSugerencias:
                 task.get("priority", "Normal"),
                 45,
             )
-            session_lengths = cls._build_session_lengths(needed_minutes)
             matching_slots = [
                 candidate
                 for candidate in available_slots
                 if cls._context_matches(task.get("context"), candidate.get("context", "flexible"))
             ]
-            slot = next(
-                (
-                    candidate
-                    for candidate in matching_slots
-                    if candidate["duration_minutes"] >= needed_minutes + cls._break_minutes_for_slot(
-                        candidate["duration_minutes"],
-                        needed_minutes,
-                        len(session_lengths),
-                    ) * (len(session_lengths) - 1)
-                ),
-                None,
-            )
-            if not slot:
+            if not matching_slots:
                 if not matching_slots:
                     unscheduled.append(
                         {
@@ -1535,31 +1573,50 @@ class MotorDeSugerencias:
                             "context": task.get("context"),
                         }
                     )
-                else:
-                    max_minutes = max(candidate["duration_minutes"] for candidate in matching_slots)
-                    unscheduled.append(
-                        {
-                            "task_title": task["title"],
-                            "reason": f"no cabe: necesita {needed_minutes} min y el mejor hueco compatible tiene {max_minutes} min",
-                            "required_minutes": needed_minutes,
-                            "context": task.get("context"),
-                        }
-                    )
                 continue
 
-            reason = ExplicadorDeSugerencias.build_reason(task, slot)
-            scheduled_sessions, break_minutes = cls._build_scheduled_sessions(slot, needed_minutes)
+            scheduled_sessions = cls._allocate_task_sessions(
+                available_slots,
+                task.get("context"),
+                needed_minutes,
+            )
+            if not scheduled_sessions:
+                max_minutes = max(candidate["duration_minutes"] for candidate in matching_slots)
+                unscheduled.append(
+                    {
+                        "task_title": task["title"],
+                        "reason": f"no cabe: necesita {needed_minutes} min y el mejor hueco compatible tiene {max_minutes} min",
+                        "required_minutes": needed_minutes,
+                        "context": task.get("context"),
+                    }
+                )
+                continue
+
+            primary_slot = {
+                "duration_minutes": matching_slots[0]["duration_minutes"],
+            }
+            reason = ExplicadorDeSugerencias.build_reason(task, primary_slot)
             scheduled_start = datetime.fromisoformat(scheduled_sessions[0]["slot_start"])
             scheduled_end = datetime.fromisoformat(scheduled_sessions[-1]["slot_end"])
-            remaining_minutes = int((slot["end"] - scheduled_end).total_seconds() / 60)
+            scheduled_minutes = sum(session["slot_duration_minutes"] for session in scheduled_sessions)
+            remaining_minutes = max(needed_minutes - scheduled_minutes, 0)
+            total_break_minutes = sum(session.get("break_before_minutes", 0) for session in scheduled_sessions)
             split_note = None
-            if len(scheduled_sessions) > 1:
+            if remaining_minutes > 0:
+                split_note = (
+                    f"Hoy se programan {scheduled_minutes} de {needed_minutes} min en "
+                    f"{len(scheduled_sessions)} bloques priorizados"
+                )
+                if total_break_minutes > 0:
+                    split_note += f", con {total_break_minutes} min totales de pausa protegida"
+                split_note += f". Quedan {remaining_minutes} min pendientes para siguientes huecos."
+            elif len(scheduled_sessions) > 1:
                 split_note = (
                     f"Se divide en {len(scheduled_sessions)} bloques para mantener foco sostenible "
                     f"en una tarea de {needed_minutes} min"
                 )
-                if break_minutes > 0:
-                    split_note += f", con pausas de {break_minutes} min entre bloques."
+                if total_break_minutes > 0:
+                    split_note += f", con {total_break_minutes} min totales de pausa protegida."
                 else:
                     split_note += "."
             suggestions.append(
@@ -1569,32 +1626,21 @@ class MotorDeSugerencias:
                     "category": task.get("category", "General"),
                     "priority": task.get("priority", "Normal"),
                     "context": task.get("context"),
-                    "slot_label": cls._slot_label(scheduled_start, scheduled_end),
+                    "slot_label": " | ".join(session["slot_label"] for session in scheduled_sessions),
                     "slot_start": scheduled_start.isoformat(),
                     "slot_end": scheduled_end.isoformat(),
-                    "slot_duration_minutes": needed_minutes,
-                    "slot_duration": needed_minutes,
-                    "available_window_minutes": slot["duration_minutes"],
+                    "slot_duration_minutes": scheduled_minutes,
+                    "slot_duration": scheduled_minutes,
+                    "available_window_minutes": sum(session["slot_duration_minutes"] for session in scheduled_sessions),
                     "scheduled_span_minutes": int((scheduled_end - scheduled_start).total_seconds() / 60),
                     "split_sessions": scheduled_sessions,
                     "split_note": split_note,
-                    "break_between_sessions_minutes": break_minutes,
+                    "break_between_sessions_minutes": total_break_minutes,
                     "required_minutes": needed_minutes,
                     "reason": reason,
+                    "remaining_minutes": remaining_minutes,
                 }
             )
-            available_slots.remove(slot)
-            if remaining_minutes >= cls.MIN_SLOT_MINUTES:
-                available_slots.append(
-                    {
-                        "start": scheduled_end,
-                        "end": slot["end"],
-                        "duration_minutes": remaining_minutes,
-                        "label": cls._slot_label(scheduled_end, slot["end"]),
-                        "context": slot.get("context", "flexible"),
-                    }
-                )
-                available_slots.sort(key=lambda candidate: candidate["start"])
 
         return suggestions, unscheduled
 
@@ -2305,6 +2351,8 @@ class Asistente:
                     else:
                         title = f"[Asistente] {suggestion['task_title']}"
                         division_note = ""
+                        if suggestion.get("split_note"):
+                            division_note = f"Plan parcial: {suggestion['split_note']}"
 
                     description = (
                         f"Categoria: {suggestion['category']}\n"
