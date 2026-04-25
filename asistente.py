@@ -82,6 +82,16 @@ def get_timezone(tz_name: str):
         return timezone.utc
 
 
+CATEGORY_COLOR_MAP = {
+    "🧠 Estudio": "9",
+    "💪 Gym": "2",
+    "🇩🇪 Alemania": "5",
+    "🎥 Divulgación": "6",
+    "🔬 Investigación": "3",
+    "🌊 Sandbox": "8",
+}
+
+
 class ConfigAsistente:
     """Centraliza las variables de entorno."""
 
@@ -301,7 +311,7 @@ class CalendarSourceIntelligence:
 class GoogleCalendarIntegration:
     """Obtiene eventos de Google Calendar para las proximas 24 horas."""
 
-    CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+    CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
     def __init__(
         self,
@@ -350,6 +360,17 @@ class GoogleCalendarIntegration:
         return base_date.replace(tzinfo=timezone.utc)
 
     @staticmethod
+    def _localize_iso_datetime(value: str, tz_name: str) -> str:
+        """Garantiza un datetime ISO 8601 aware en la zona configurada."""
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        local_tz = get_timezone(tz_name)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=local_tz)
+        else:
+            parsed = parsed.astimezone(local_tz)
+        return parsed.isoformat()
+
+    @staticmethod
     def _build_event_payload(raw_event: Dict, calendar_id: str) -> Dict:
         """Normaliza un evento de Google Calendar."""
         start_raw = raw_event["start"].get("dateTime", raw_event["start"].get("date"))
@@ -391,6 +412,44 @@ class GoogleCalendarIntegration:
     def get_calendar_snapshot(self) -> List[Dict]:
         """Devuelve el ultimo snapshot de calendarios clasificados."""
         return self.last_calendar_snapshot
+
+    def create_event(
+        self,
+        title: str,
+        start_iso: str,
+        end_iso: str,
+        description: str = "",
+        calendar_id: str = "primary",
+        color_id: str | None = None,
+    ) -> dict | None:
+        """Crea un evento en Google Calendar reutilizando la sesion autenticada."""
+        timezone_name = os.environ.get("TIMEZONE", "America/Guayaquil")
+        try:
+            event_body = {
+                "summary": title,
+                "start": {
+                    "dateTime": self._localize_iso_datetime(start_iso, timezone_name),
+                    "timeZone": timezone_name,
+                },
+                "end": {
+                    "dateTime": self._localize_iso_datetime(end_iso, timezone_name),
+                    "timeZone": timezone_name,
+                },
+                "description": description,
+            }
+            if color_id:
+                event_body["colorId"] = color_id
+
+            created_event = (
+                self.service.events()
+                .insert(calendarId=calendar_id, body=event_body)
+                .execute()
+            )
+            logger.info("Evento creado en Google Calendar: %s", created_event.get("id"))
+            return created_event
+        except Exception as exc:
+            logger.error("Error creando evento en Google Calendar: %s", exc)
+            return None
 
     def get_events_horizon(self, calendar_ids: List[str], hours: int = 48) -> List[Dict]:
         """Obtiene todos los eventos del horizonte solicitado para uno o varios calendarios."""
@@ -792,6 +851,7 @@ class NotionIntegration:
         tasks: List[Dict],
         timestamp: datetime,
         diagnostics: Optional[Dict] = None,
+        created_events: Optional[List[Dict]] = None,
     ) -> bool:
         """Agrega un reporte resumido a la pagina de salida."""
         try:
@@ -861,6 +921,29 @@ class NotionIntegration:
                         },
                     }
                 )
+
+            if created_events:
+                blocks.append(
+                    {
+                        "object": "block",
+                        "type": "heading_3",
+                        "heading_3": {
+                            "rich_text": self._make_rich_text("Eventos creados en Google Calendar")
+                        },
+                    }
+                )
+                for event in created_events:
+                    blocks.append(
+                        {
+                            "object": "block",
+                            "type": "bulleted_list_item",
+                            "bulleted_list_item": {
+                                "rich_text": self._make_rich_text(
+                                    f"{event['summary']} | {event['start']['dateTime']} → {event['end']['dateTime']}"
+                                )
+                            },
+                        }
+                    )
 
             if free_slots:
                 blocks.append(
@@ -1343,9 +1426,15 @@ class MotorDeSugerencias:
             reason = ExplicadorDeSugerencias.build_reason(task, slot)
             suggestions.append(
                 {
+                    "task_id": task["id"],
                     "task_title": task["title"],
+                    "category": task.get("category", "General"),
                     "priority": task.get("priority", "Normal"),
+                    "context": task.get("context"),
                     "slot_label": slot["label"],
+                    "slot_start": slot["start"].isoformat(),
+                    "slot_end": slot["end"].isoformat(),
+                    "slot_duration_minutes": slot["duration_minutes"],
                     "slot_duration": slot["duration_minutes"],
                     "required_minutes": needed_minutes,
                     "reason": reason,
@@ -1372,7 +1461,7 @@ class EmailConstructor:
             return (
                 f"Hoy tienes una ventana clara de {longest_slot['duration_minutes']} minutos. "
                 f"El mejor movimiento es enfocar primero '{best['task_title']}' en el bloque {best['slot_label']}, "
-                f"alineado con su necesidad real de {best.get('required_minutes', best['slot_duration'])} minutos."
+                f"alineado con su necesidad real de {best.get('required_minutes', best.get('slot_duration_minutes', best['slot_duration']))} minutos."
             )
 
         if free_slots:
@@ -1451,7 +1540,7 @@ class EmailConstructor:
                             {suggestion['task_title']}
                         </div>
                         <div style="font-size:14px; color:#334155; margin-bottom:8px;">
-                            Recomendado para {suggestion['slot_label']} ({suggestion['slot_duration']} min disponibles)
+                            Recomendado para {suggestion['slot_label']} ({suggestion.get('slot_duration_minutes', suggestion['slot_duration'])} min disponibles)
                         </div>
                         <div style="font-size:13px; color:#0f172a; margin-bottom:8px; font-weight:600;">
                             Duracion estimada de la tarea: {suggestion.get('required_minutes', 'N/D')} min
@@ -1755,7 +1844,7 @@ class EmailConstructor:
                                 {top_suggestion['task_title'] if top_suggestion else 'Analizando tu flujo optimo...'}
                             </div>
                             <div style="font-size:14px; line-height:1.6; color:#e2e8f0;">
-                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion['slot_duration']} min disponibles) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion['slot_duration'])} min. {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
+                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration'])} min disponibles) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration']))} min. {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
                             </div>
                         </div>
                     </div>
@@ -2022,6 +2111,30 @@ class Asistente:
                 self.tasks,
                 self.free_slots,
             )
+            created_events: List[Dict] = []
+            for suggestion in self.suggestions:
+                title = f"[ZENTRUM] {suggestion['task_title']}"
+                description = (
+                    f"Categoría: {suggestion['category']}\n"
+                    f"Prioridad: {suggestion['priority']}\n"
+                    f"Contexto: {suggestion.get('context') or '—'}\n"
+                    f"Motivo: {suggestion['reason']}"
+                )
+                color_id = CATEGORY_COLOR_MAP.get(suggestion["category"])
+                created_event = calendar.create_event(
+                    title,
+                    suggestion["slot_start"],
+                    suggestion["slot_end"],
+                    description,
+                    color_id=color_id,
+                )
+                if created_event is not None:
+                    created_events.append(created_event)
+            logger.info(
+                "%s/%s eventos creados en Google Calendar",
+                len(created_events),
+                len(self.suggestions),
+            )
             self.diagnostics = DiagnosticReporter.build(
                 calendar.get_calendar_snapshot(),
                 self.events,
@@ -2066,6 +2179,7 @@ class Asistente:
                 self.tasks,
                 now.astimezone(get_timezone(self.config.TIMEZONE)),
                 self.diagnostics if self.config.DIAGNOSTIC_MODE else None,
+                created_events,
             )
             if not notion_ok:
                 return 1
