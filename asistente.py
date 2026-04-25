@@ -719,7 +719,7 @@ class NotionIntegration:
         if progress_percent is not None and progress_percent >= 100:
             return False, "descartada: progreso al 100%"
         if status in {"en progreso", "in progress", "en curso"}:
-    return True, "incluida: en progreso"
+            return True, "incluida: en progreso"
 
         if not due_date:
             return False, "descartada: no tiene fecha limite"
