@@ -863,6 +863,7 @@ class NotionIntegration:
         if status_name and status_prop:
             prop_type = status_prop.get("type")
             status_data = props.get(status_name, {})
+            print(f"DEBUG | status_name='{status_name}' | prop_type='{prop_type}' | status_data={status_data} | props_keys={list(props.keys())}")
             if prop_type == "status":
                 status_value = (status_data.get("status") or {}).get("name", "Por hacer")
             elif prop_type == "select":
