@@ -670,6 +670,19 @@ class NotionIntegration:
 
         return None, None
 
+    @staticmethod
+    def _extract_numeric_property_value(prop_type: Optional[str], prop_value: Dict) -> Optional[float]:
+        """Extrae un valor numerico desde propiedades number o formula de Notion."""
+        if not prop_type:
+            return None
+        if prop_type == "number":
+            return prop_value.get("number")
+        if prop_type == "formula":
+            formula = prop_value.get("formula") or {}
+            if formula.get("type") == "number":
+                return formula.get("number")
+        return None
+
     def _build_query_payload(self, properties: Dict) -> Dict:
         """Construye un payload amplio; el filtrado fino se hace localmente para diagnostico."""
         due_name, _ = self._find_property(
@@ -694,10 +707,19 @@ class NotionIntegration:
         status = self._normalize_label(task.get("status", ""))
         due_date = task.get("due_date")
         priority = self._normalize_label(task.get("priority", ""))
+        remaining_minutes = task.get("remaining_minutes")
+        progress_percent = task.get("progress_percent")
+        completed_flag = task.get("completed_flag", False)
 
         completed_aliases = {"completado", "completed", "done", "hecho", "listo", "finalizado"}
-        if status in completed_aliases:
+        if completed_flag or status in completed_aliases:
             return False, "descartada: ya completada"
+        if remaining_minutes is not None and remaining_minutes <= 0:
+            return False, "descartada: sin minutos restantes"
+        if progress_percent is not None and progress_percent >= 100:
+            return False, "descartada: progreso al 100%"
+        if status == "en progreso":
+            return True, "incluida: en progreso"
 
         if not due_date:
             return False, "descartada: no tiene fecha limite"
@@ -770,7 +792,7 @@ class NotionIntegration:
         )
         duration_name, duration_prop = self._find_property(
             properties,
-            ["number"],
+            ["number", "formula"],
             [
                 "Duracion estimada",
                 "Duracion",
@@ -784,6 +806,54 @@ class NotionIntegration:
             properties,
             ["select", "status", "multi_select", "rich_text"],
             ["Contexto", "Context", "Ubicacion", "Lugar"],
+        )
+        remaining_name, remaining_prop = self._find_property(
+            properties,
+            ["number", "formula"],
+            [
+                "Minutos restantes",
+                "⏳ Minutos Restantes",
+                "Tiempo restante",
+                "Remaining Minutes",
+                "Remaining Time",
+            ],
+        )
+        blocks_done_name, blocks_done_prop = self._find_property(
+            properties,
+            ["number"],
+            ["Bloques Completados", "🧩 Bloques Completados"],
+        )
+        total_blocks_name, total_blocks_prop = self._find_property(
+            properties,
+            ["number"],
+            ["Total Bloques", "🔢 Total Bloques"],
+        )
+        completed_minutes_name, completed_minutes_prop = self._find_property(
+            properties,
+            ["number", "formula"],
+            [
+                "Minutos completados",
+                "Minutos estudiados",
+                "Tiempo completado",
+                "Completed Minutes",
+                "Studied Minutes",
+            ],
+        )
+        progress_name, progress_prop = self._find_property(
+            properties,
+            ["number", "formula"],
+            [
+                "Progreso",
+                "Progreso %",
+                "Progress",
+                "Progress %",
+                "% completado",
+            ],
+        )
+        completed_name, completed_prop = self._find_property(
+            properties,
+            ["checkbox"],
+            ["Completada", "Completado", "Done", "Completed"],
         )
 
         title_items = props.get(title_name or "", {}).get("title", [])
@@ -830,9 +900,69 @@ class NotionIntegration:
 
         estimated_minutes = None
         if duration_name and duration_prop:
-            estimated_minutes = props.get(duration_name, {}).get("number")
+            estimated_minutes = self._extract_numeric_property_value(
+                duration_prop.get("type"),
+                props.get(duration_name, {}),
+            )
             if estimated_minutes is not None:
                 estimated_minutes = int(estimated_minutes)
+
+        remaining_minutes = None
+        if remaining_name and remaining_prop:
+            remaining_minutes = self._extract_numeric_property_value(
+                remaining_prop.get("type"),
+                props.get(remaining_name, {}),
+            )
+        if remaining_minutes is not None:
+            remaining_minutes = max(int(remaining_minutes), 0)
+
+        blocks_done = None
+        if blocks_done_name and blocks_done_prop:
+            blocks_done = props.get(blocks_done_name, {}).get("number")
+            if blocks_done is not None:
+                blocks_done = int(blocks_done)
+
+        total_blocks = None
+        if total_blocks_name and total_blocks_prop:
+            total_blocks = props.get(total_blocks_name, {}).get("number")
+            if total_blocks is not None:
+                total_blocks = int(total_blocks)
+
+        completed_minutes = None
+        if completed_minutes_name and completed_minutes_prop:
+            completed_minutes = self._extract_numeric_property_value(
+                completed_minutes_prop.get("type"),
+                props.get(completed_minutes_name, {}),
+            )
+            if completed_minutes is not None:
+                completed_minutes = max(int(completed_minutes), 0)
+
+        progress_percent = None
+        if progress_name and progress_prop:
+            progress_percent = self._extract_numeric_property_value(
+                progress_prop.get("type"),
+                props.get(progress_name, {}),
+            )
+            if progress_percent is not None:
+                progress_percent = float(progress_percent)
+                if progress_percent <= 1:
+                    progress_percent *= 100
+                progress_percent = max(0.0, min(progress_percent, 100.0))
+
+        completed_flag = False
+        if completed_name and completed_prop:
+            completed_flag = bool(props.get(completed_name, {}).get("checkbox"))
+
+        if remaining_minutes is None and estimated_minutes is not None and completed_minutes is not None:
+            remaining_minutes = max(estimated_minutes - completed_minutes, 0)
+        if completed_minutes is None and estimated_minutes is not None and remaining_minutes is not None:
+            completed_minutes = max(estimated_minutes - remaining_minutes, 0)
+        if progress_percent is None and estimated_minutes and completed_minutes is not None:
+            progress_percent = min((completed_minutes / estimated_minutes) * 100, 100.0)
+        if remaining_minutes is not None and remaining_minutes <= 0:
+            completed_flag = True
+        if progress_percent is not None and progress_percent >= 100:
+            completed_flag = True
 
         context_value = None
         if context_name and context_prop:
@@ -856,6 +986,12 @@ class NotionIntegration:
             "priority": priority_value,
             "category": category_value,
             "estimated_minutes": estimated_minutes,
+            "remaining_minutes": remaining_minutes,
+            "blocks_done": blocks_done,
+            "total_blocks": total_blocks,
+            "completed_minutes": completed_minutes,
+            "progress_percent": progress_percent,
+            "completed_flag": completed_flag,
             "context": context_value,
         }
 
@@ -947,8 +1083,15 @@ class NotionIntegration:
                     }
                 )
                 for suggestion in suggestions[:5]:
+                    blocks_done = suggestion.get("blocks_done")
+                    total_blocks = suggestion.get("total_blocks")
+                    if blocks_done is not None and total_blocks is not None:
+                        next_block = blocks_done + 1
+                        block_label = f" — bloque {next_block}/{total_blocks}"
+                    else:
+                        block_label = ""
                     line = (
-                        f"{suggestion['task_title']} -> "
+                        f"{suggestion['task_title']}{block_label} -> "
                         f"{suggestion['slot_label']} | "
                         f"{suggestion.get('split_note') + ' ' if suggestion.get('split_note') else ''}"
                         f"{suggestion['reason']}"
@@ -1158,7 +1301,11 @@ class ExplicadorDeSugerencias:
     def build_reason(task: Dict, slot: Dict) -> str:
         priority = task.get("priority", "Normal")
         due_date = task.get("due_date")
-        estimated = task.get("estimated_minutes")
+        status = (task.get("status", "") or "").lower()
+        if status == "en progreso" and task.get("remaining_minutes") is not None:
+            estimated = task.get("remaining_minutes")
+        else:
+            estimated = task.get("estimated_minutes")
 
         reasons = []
 
@@ -1294,6 +1441,14 @@ class MotorDeSugerencias:
         if "facultad" in normalized or "campus" in normalized or "universidad" in normalized:
             return slot_context in {"facultad", "flexible"}
         return True
+
+    @classmethod
+    def get_effective_minutes(cls, task: Dict) -> Optional[int]:
+        """Devuelve la duracion efectiva a programar segun el estado de la tarea."""
+        status = cls._normalize_text(task.get("status", ""))
+        if status == "en progreso" and task.get("remaining_minutes") is not None:
+            return task["remaining_minutes"]
+        return task.get("estimated_minutes")
 
     @classmethod
     def _build_session_lengths(cls, needed_minutes: int) -> List[int]:
@@ -1554,7 +1709,7 @@ class MotorDeSugerencias:
         unscheduled = []
 
         for task in ordered_tasks:
-            needed_minutes = task.get("estimated_minutes") or cls.DEFAULT_TASK_MINUTES.get(
+            needed_minutes = cls.get_effective_minutes(task) or cls.DEFAULT_TASK_MINUTES.get(
                 task.get("priority", "Normal"),
                 45,
             )
@@ -1626,6 +1781,8 @@ class MotorDeSugerencias:
                     "category": task.get("category", "General"),
                     "priority": task.get("priority", "Normal"),
                     "context": task.get("context"),
+                    "blocks_done": task.get("blocks_done"),
+                    "total_blocks": task.get("total_blocks"),
                     "slot_label": " | ".join(session["slot_label"] for session in scheduled_sessions),
                     "slot_start": scheduled_start.isoformat(),
                     "slot_end": scheduled_end.isoformat(),
@@ -1637,8 +1794,10 @@ class MotorDeSugerencias:
                     "split_note": split_note,
                     "break_between_sessions_minutes": total_break_minutes,
                     "required_minutes": needed_minutes,
+                    "estimated_total_minutes": task.get("estimated_minutes"),
                     "reason": reason,
                     "remaining_minutes": remaining_minutes,
+                    "progress_percent": task.get("progress_percent"),
                 }
             )
 
@@ -1750,8 +1909,9 @@ class EmailConstructor:
                             Recomendado para {suggestion['slot_label']} ({suggestion.get('slot_duration_minutes', suggestion['slot_duration'])} min programados)
                         </div>
                         <div style="font-size:13px; color:#0f172a; margin-bottom:8px; font-weight:600;">
-                            Duracion estimada de la tarea: {suggestion.get('required_minutes', 'N/D')} min
+                            Tiempo a programar ahora: {suggestion.get('required_minutes', 'N/D')} min
                         </div>
+                        {f"<div style='font-size:13px; color:#334155; margin-bottom:8px;'>Estimacion total original: {suggestion['estimated_total_minutes']} min</div>" if suggestion.get('estimated_total_minutes') and suggestion.get('estimated_total_minutes') != suggestion.get('required_minutes') else ""}
                         {split_note_html}
                         <div style="font-size:13px; color:#64748b; line-height:1.6;">
                             {suggestion['reason']}
@@ -2338,6 +2498,10 @@ class Asistente:
                 planned_events += len(split_sessions)
 
                 for session in split_sessions:
+                    block_info = ""
+                    if suggestion.get("blocks_done") is not None and suggestion.get("total_blocks") is not None:
+                        next_block = suggestion["blocks_done"] + 1
+                        block_info = f"\nBloque: {next_block}/{suggestion['total_blocks']}"
                     if session["session_total"] > 1:
                         title = (
                             f"[Asistente] {suggestion['task_title']} "
@@ -2357,9 +2521,24 @@ class Asistente:
                     description = (
                         f"Categoria: {suggestion['category']}\n"
                         f"Prioridad: {suggestion['priority']}\n"
-                        f"Contexto: {suggestion.get('context') or '-'}\n"
+                        f"Contexto: {suggestion.get('context') or '-'}{block_info}\n"
                         f"Motivo: {suggestion['reason']}"
                     )
+                    if suggestion.get("estimated_total_minutes"):
+                        description = (
+                            f"{description}\n"
+                            f"Estimacion total original: {suggestion['estimated_total_minutes']} min"
+                        )
+                    if suggestion.get("progress_percent") is not None:
+                        description = (
+                            f"{description}\n"
+                            f"Progreso actual en Notion: {round(suggestion['progress_percent'])}%"
+                        )
+                    if suggestion.get("remaining_minutes") is not None:
+                        description = (
+                            f"{description}\n"
+                            f"Minutos pendientes despues de lo programado hoy: {suggestion['remaining_minutes']}"
+                        )
                     if division_note:
                         description = f"{description}\n{division_note}"
 
