@@ -1683,6 +1683,13 @@ class EmailConstructor:
                 "Normal": "#2563eb",
                 "Baja": "#64748b",
             }.get(priority, "#2563eb")
+            split_note_html = ""
+            if suggestion.get("split_note"):
+                split_note_html = (
+                    '<div style="font-size:13px; color:#7c2d12; margin-bottom:8px; font-weight:600;">'
+                    f"{suggestion['split_note']}"
+                    "</div>"
+                )
             suggestion_cards_html += f"""
             <tr>
                 <td style="padding-bottom: 14px;">
@@ -1699,7 +1706,7 @@ class EmailConstructor:
                         <div style="font-size:13px; color:#0f172a; margin-bottom:8px; font-weight:600;">
                             Duracion estimada de la tarea: {suggestion.get('required_minutes', 'N/D')} min
                         </div>
-                        {f"<div style=\"font-size:13px; color:#7c2d12; margin-bottom:8px; font-weight:600;\">{suggestion['split_note']}</div>" if suggestion.get('split_note') else ""}
+                        {split_note_html}
                         <div style="font-size:13px; color:#64748b; line-height:1.6;">
                             {suggestion['reason']}
                         </div>
