@@ -950,6 +950,7 @@ class NotionIntegration:
                     line = (
                         f"{suggestion['task_title']} -> "
                         f"{suggestion['slot_label']} | "
+                        f"{suggestion.get('split_note') + ' ' if suggestion.get('split_note') else ''}"
                         f"{suggestion['reason']}"
                     )
                     blocks.append(
@@ -1186,6 +1187,8 @@ class MotorDeSugerencias:
 
     PRIORITY_SCORES = {"Urgente": 4, "Alta": 3, "Normal": 2, "Baja": 1}
     DEFAULT_TASK_MINUTES = {"Urgente": 90, "Alta": 60, "Normal": 45, "Baja": 30}
+    MAX_FOCUS_BLOCK_MINUTES = 120
+    MAX_BREAK_BETWEEN_BLOCKS_MINUTES = 15
     WORKDAY_START_HOUR = 6
     WORKDAY_END_HOUR = 22
     MIN_SLOT_MINUTES = 30
@@ -1291,6 +1294,66 @@ class MotorDeSugerencias:
         if "facultad" in normalized or "campus" in normalized or "universidad" in normalized:
             return slot_context in {"facultad", "flexible"}
         return True
+
+    @classmethod
+    def _build_session_lengths(cls, needed_minutes: int) -> List[int]:
+        """Divide tareas largas en bloques de foco mas realistas."""
+        if needed_minutes <= cls.MAX_FOCUS_BLOCK_MINUTES:
+            return [needed_minutes]
+
+        remaining = needed_minutes
+        sessions = []
+        while remaining > cls.MAX_FOCUS_BLOCK_MINUTES:
+            sessions.append(cls.MAX_FOCUS_BLOCK_MINUTES)
+            remaining -= cls.MAX_FOCUS_BLOCK_MINUTES
+        if remaining:
+            sessions.append(remaining)
+        return sessions
+
+    @classmethod
+    def _break_minutes_for_slot(cls, slot_duration_minutes: int, needed_minutes: int, session_count: int) -> int:
+        """Distribuye pausas solo si el hueco tiene margen suficiente."""
+        if session_count <= 1:
+            return 0
+
+        extra_capacity = max(slot_duration_minutes - needed_minutes, 0)
+        pause_count = session_count - 1
+        return min(cls.MAX_BREAK_BETWEEN_BLOCKS_MINUTES, extra_capacity // pause_count)
+
+    @classmethod
+    def _build_scheduled_sessions(
+        cls,
+        slot: Dict,
+        needed_minutes: int,
+    ) -> Tuple[List[Dict], int]:
+        """Construye sesiones concretas dentro del hueco seleccionado."""
+        session_lengths = cls._build_session_lengths(needed_minutes)
+        break_minutes = cls._break_minutes_for_slot(
+            slot["duration_minutes"],
+            needed_minutes,
+            len(session_lengths),
+        )
+
+        scheduled_sessions = []
+        cursor = slot["start"]
+        for index, session_minutes in enumerate(session_lengths, start=1):
+            session_start = cursor
+            session_end = session_start + timedelta(minutes=session_minutes)
+            scheduled_sessions.append(
+                {
+                    "slot_start": session_start.isoformat(),
+                    "slot_end": session_end.isoformat(),
+                    "slot_label": cls._slot_label(session_start, session_end),
+                    "slot_duration_minutes": session_minutes,
+                    "session_index": index,
+                    "session_total": len(session_lengths),
+                }
+            )
+            cursor = session_end
+            if index < len(session_lengths):
+                cursor = cursor + timedelta(minutes=break_minutes)
+
+        return scheduled_sessions, break_minutes
 
     @classmethod
     def find_free_slots(
@@ -1444,13 +1507,22 @@ class MotorDeSugerencias:
                 task.get("priority", "Normal"),
                 45,
             )
+            session_lengths = cls._build_session_lengths(needed_minutes)
             matching_slots = [
                 candidate
                 for candidate in available_slots
                 if cls._context_matches(task.get("context"), candidate.get("context", "flexible"))
             ]
             slot = next(
-                (candidate for candidate in matching_slots if candidate["duration_minutes"] >= needed_minutes),
+                (
+                    candidate
+                    for candidate in matching_slots
+                    if candidate["duration_minutes"] >= needed_minutes + cls._break_minutes_for_slot(
+                        candidate["duration_minutes"],
+                        needed_minutes,
+                        len(session_lengths),
+                    ) * (len(session_lengths) - 1)
+                ),
                 None,
             )
             if not slot:
@@ -1476,9 +1548,20 @@ class MotorDeSugerencias:
                 continue
 
             reason = ExplicadorDeSugerencias.build_reason(task, slot)
-            scheduled_start = slot["start"]
-            scheduled_end = scheduled_start + timedelta(minutes=needed_minutes)
+            scheduled_sessions, break_minutes = cls._build_scheduled_sessions(slot, needed_minutes)
+            scheduled_start = datetime.fromisoformat(scheduled_sessions[0]["slot_start"])
+            scheduled_end = datetime.fromisoformat(scheduled_sessions[-1]["slot_end"])
             remaining_minutes = int((slot["end"] - scheduled_end).total_seconds() / 60)
+            split_note = None
+            if len(scheduled_sessions) > 1:
+                split_note = (
+                    f"Se divide en {len(scheduled_sessions)} bloques para mantener foco sostenible "
+                    f"en una tarea de {needed_minutes} min"
+                )
+                if break_minutes > 0:
+                    split_note += f", con pausas de {break_minutes} min entre bloques."
+                else:
+                    split_note += "."
             suggestions.append(
                 {
                     "task_id": task["id"],
@@ -1492,6 +1575,10 @@ class MotorDeSugerencias:
                     "slot_duration_minutes": needed_minutes,
                     "slot_duration": needed_minutes,
                     "available_window_minutes": slot["duration_minutes"],
+                    "scheduled_span_minutes": int((scheduled_end - scheduled_start).total_seconds() / 60),
+                    "split_sessions": scheduled_sessions,
+                    "split_note": split_note,
+                    "break_between_sessions_minutes": break_minutes,
                     "required_minutes": needed_minutes,
                     "reason": reason,
                 }
@@ -1612,6 +1699,7 @@ class EmailConstructor:
                         <div style="font-size:13px; color:#0f172a; margin-bottom:8px; font-weight:600;">
                             Duracion estimada de la tarea: {suggestion.get('required_minutes', 'N/D')} min
                         </div>
+                        {f"<div style=\"font-size:13px; color:#7c2d12; margin-bottom:8px; font-weight:600;\">{suggestion['split_note']}</div>" if suggestion.get('split_note') else ""}
                         <div style="font-size:13px; color:#64748b; line-height:1.6;">
                             {suggestion['reason']}
                         </div>
@@ -1911,7 +1999,7 @@ class EmailConstructor:
                                 {top_suggestion['task_title'] if top_suggestion else 'Analizando tu flujo optimo...'}
                             </div>
                             <div style="font-size:14px; line-height:1.6; color:#e2e8f0;">
-                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration'])} min programados) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration']))} min. {top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
+                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration'])} min programados) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration']))} min. {top_suggestion['split_note'] + ' ' if top_suggestion.get('split_note') else ''}{top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
                             </div>
                         </div>
                     </div>
@@ -2179,7 +2267,57 @@ class Asistente:
                 self.free_slots,
             )
             created_events: List[Dict] = []
+            planned_events = 0
             for suggestion in self.suggestions:
+                color_id = CATEGORY_COLOR_MAP.get(suggestion["category"])
+                split_sessions = suggestion.get("split_sessions") or [
+                    {
+                        "slot_start": suggestion["slot_start"],
+                        "slot_end": suggestion["slot_end"],
+                        "slot_duration_minutes": suggestion.get(
+                            "slot_duration_minutes",
+                            suggestion["slot_duration"],
+                        ),
+                        "session_index": 1,
+                        "session_total": 1,
+                    }
+                ]
+                planned_events += len(split_sessions)
+
+                for session in split_sessions:
+                    if session["session_total"] > 1:
+                        title = (
+                            f"[Asistente] {suggestion['task_title']} "
+                            f"({session['session_index']}/{session['session_total']})"
+                        )
+                        division_note = (
+                            f"Division sugerida: {suggestion['split_note']}\n"
+                            f"Este evento corresponde al bloque {session['session_index']}/"
+                            f"{session['session_total']} de {session['slot_duration_minutes']} min."
+                        )
+                    else:
+                        title = f"[Asistente] {suggestion['task_title']}"
+                        division_note = ""
+
+                    description = (
+                        f"Categoria: {suggestion['category']}\n"
+                        f"Prioridad: {suggestion['priority']}\n"
+                        f"Contexto: {suggestion.get('context') or '-'}\n"
+                        f"Motivo: {suggestion['reason']}"
+                    )
+                    if division_note:
+                        description = f"{description}\n{division_note}"
+
+                    created_event = calendar.create_event(
+                        title,
+                        session["slot_start"],
+                        session["slot_end"],
+                        description,
+                        color_id=color_id,
+                    )
+                    if created_event is not None:
+                        created_events.append(created_event)
+            for suggestion in []:
                 title = f"[Asistente] {suggestion['task_title']}"
                 description = (
                     f"Categoría: {suggestion['category']}\n"
@@ -2200,7 +2338,7 @@ class Asistente:
             logger.info(
                 "%s/%s eventos creados en Google Calendar",
                 len(created_events),
-                len(self.suggestions),
+                planned_events,
             )
             self.diagnostics = DiagnosticReporter.build(
                 calendar.get_calendar_snapshot(),
