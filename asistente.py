@@ -712,14 +712,33 @@ class NotionIntegration:
         completed_flag = task.get("completed_flag", False)
 
         completed_aliases = {"completado", "completed", "done", "hecho", "listo", "finalizado"}
-        if completed_flag or status in completed_aliases:
-            return False, "descartada: ya completada"
-        if remaining_minutes is not None and remaining_minutes <= 0:
-            return False, "descartada: sin minutos restantes"
-        if progress_percent is not None and progress_percent >= 100:
-            return False, "descartada: progreso al 100%"
+
+        # ------------------------------------------------------------------ #
+        # FIX #1: "En progreso" tiene prioridad absoluta sobre cualquier      #
+        # otro check. Se evalua ANTES de completed_flag y remaining_minutes.  #
+        # Esto evita que una tarea activa sea descartada porque su campo      #
+        # "Minutos Restantes" devuelve 0 o porque completed_flag se activó   #
+        # erroneamente durante la extraccion.                                 #
+        # ------------------------------------------------------------------ #
         if status == "en progreso":
             return True, "incluida: en progreso"
+
+        # Para tareas que NO estan en progreso aplicamos checks normales.
+        if completed_flag or status in completed_aliases:
+            return False, "descartada: ya completada"
+
+        # FIX #2: remaining_minutes == 0 solo descarta si ADEMAS el progreso
+        # confirma 100%. Un campo vacio o en 0 por formula sin calcular no
+        # debe ser motivo suficiente para descartar.
+        if (
+            remaining_minutes is not None
+            and remaining_minutes <= 0
+            and (progress_percent is None or progress_percent >= 100)
+        ):
+            return False, "descartada: sin minutos restantes"
+
+        if progress_percent is not None and progress_percent >= 100:
+            return False, "descartada: progreso al 100%"
 
         if not due_date:
             return False, "descartada: no tiene fecha limite"
@@ -959,10 +978,18 @@ class NotionIntegration:
             completed_minutes = max(estimated_minutes - remaining_minutes, 0)
         if progress_percent is None and estimated_minutes and completed_minutes is not None:
             progress_percent = min((completed_minutes / estimated_minutes) * 100, 100.0)
-        if remaining_minutes is not None and remaining_minutes <= 0:
-            completed_flag = True
-        if progress_percent is not None and progress_percent >= 100:
-            completed_flag = True
+
+        # ------------------------------------------------------------------ #
+        # FIX #3: completed_flag por remaining/progress solo se activa si     #
+        # la tarea NO esta "En progreso". Evita que una tarea activa quede    #
+        # marcada como completada por un campo en 0 o formula sin calcular.   #
+        # ------------------------------------------------------------------ #
+        status_normalized = self._normalize_label(status_value)
+        if status_normalized != "en progreso":
+            if remaining_minutes is not None and remaining_minutes <= 0:
+                completed_flag = True
+            if progress_percent is not None and progress_percent >= 100:
+                completed_flag = True
 
         context_value = None
         if context_name and context_prop:
@@ -1446,9 +1473,20 @@ class MotorDeSugerencias:
     def get_effective_minutes(cls, task: Dict) -> Optional[int]:
         """Devuelve la duracion efectiva a programar segun el estado de la tarea."""
         status = cls._normalize_text(task.get("status", ""))
-        if status == "en progreso" and task.get("remaining_minutes") is not None:
-            return task["remaining_minutes"]
-        return task.get("estimated_minutes")
+        remaining = task.get("remaining_minutes")
+        estimated = task.get("estimated_minutes")
+
+        if status == "en progreso":
+            # FIX #4: si remaining existe y es > 0 usalo.
+            # Si es 0 o None (campo vacio o formula sin calcular),
+            # cae a estimated como respaldo antes de devolver None.
+            if remaining is not None and remaining > 0:
+                return remaining
+            if estimated is not None and estimated > 0:
+                return estimated
+            return None
+
+        return estimated
 
     @classmethod
     def _build_session_lengths(cls, needed_minutes: int) -> List[int]:
