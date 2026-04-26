@@ -999,16 +999,13 @@ class NotionIntegration:
             progress_percent = min((completed_minutes / estimated_minutes) * 100, 100.0)
 
         # ------------------------------------------------------------------ #
-        # FIX #3: completed_flag por remaining/progress solo se activa si     #
-        # la tarea NO esta "En progreso". Evita que una tarea activa quede    #
-        # marcada como completada por un campo en 0 o formula sin calcular.   #
+        # REGLA DEFINITIVA: completed_flag lo decide SOLO el campo Status     #
+        # de Notion. Nunca se infiere desde campos numericos (remaining,      #
+        # progress, bloques) porque esos campos pueden estar desactualizados. #
+        # _evaluate_task_inclusion usa status directamente para Done/Not.     #
         # ------------------------------------------------------------------ #
-        status_normalized = self._normalize_label(status_value)
-        if status_normalized not in {"en progreso", "in progress"}:
-            if remaining_minutes is not None and remaining_minutes <= 0:
-                completed_flag = True
-            if progress_percent is not None and progress_percent >= 100:
-                completed_flag = True
+        # completed_flag ya fue asignado arriba desde el checkbox si existe.
+        # No se modifica aqui.
 
         context_value = None
         if context_name and context_prop:
