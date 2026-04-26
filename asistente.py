@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-ASISTENTE: Motor de Productividad Automatizado
-==============================================
-Integracion completa:
-- Google Calendar API (proximas 24h)
-- Notion API (tareas hoy/vencidas)
-- Analisis simple de huecos disponibles
-- Sugerencias priorizadas
-- Email HTML profesional
-- Actualizacion de pagina en Notion con resultados
-
-Ejecucion: python asistente.py
+ASISTENTE - Motor de Productividad
+===================================
+Arquitectura simplificada basada en 6 pilares:
+1. Autoridad de Tiempos: Notion fórmulas son la fuente de verdad (solo lectura).
+2. Jerarquía por Score Urgencia: ordena y asigna huecos por score desc.
+3. Sin micro-bloques: duración mínima de sesión = duración_total / total_bloques.
+4. Eliminación de página Motor de Sugerencias: resultado final = calendario.
+5. Planificación integral: todas las tareas pendientes, no solo In progress.
+6. Sincronización de Status: marca In progress solo lo que se agendó hoy.
 """
 
 import json
@@ -32,29 +30,25 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# Buscamos el archivo .env en la misma carpeta donde esta este script.
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 
-def configure_console_encoding():
-    """Intenta forzar UTF-8 para evitar errores con Unicode en Windows."""
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream and hasattr(stream, "reconfigure"):
+# ---------------------------------------------------------------------------
+# Consola y logging
+# ---------------------------------------------------------------------------
+
+def _fix_encoding():
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s and hasattr(s, "reconfigure"):
             try:
-                stream.reconfigure(encoding="utf-8")
+                s.reconfigure(encoding="utf-8")
             except Exception:
                 pass
 
 
-configure_console_encoding()
-
-if os.getenv("NOTION_API_KEY"):
-    print("✅ Conexion con archivo .env establecida")
-else:
-    print("❌ ERROR: No se encuentran las variables en el .env")
-
+_fix_encoding()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,403 +56,232 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+if os.getenv("NOTION_API_KEY"):
+    print("OK Variables de entorno cargadas")
+else:
+    print("ERROR: No se encuentran las variables de entorno")
 
-def get_timezone(tz_name: str):
-    """Devuelve una zona horaria valida con fallback para Windows."""
+
+# ---------------------------------------------------------------------------
+# Zona horaria
+# ---------------------------------------------------------------------------
+
+def get_tz(name: str):
     try:
-        return ZoneInfo(tz_name)
+        return ZoneInfo(name)
     except ZoneInfoNotFoundError:
-        if tz_name == "America/Guayaquil":
-            logger.warning(
-                "No se encontro la zona %s en el sistema. Se usara UTC-05:00 como respaldo.",
-                tz_name,
-            )
+        if name == "America/Guayaquil":
             return timezone(timedelta(hours=-5), name="America/Guayaquil")
-
-        logger.warning(
-            "No se encontro la zona %s. Se usara UTC como respaldo.",
-            tz_name,
-        )
         return timezone.utc
 
 
-CATEGORY_COLOR_MAP = {
-    "🧠 Estudio": "9",
-    "💪 Gym": "2",
-    "🇩🇪 Alemania": "5",
-    "🎥 Divulgación": "6",
+# ---------------------------------------------------------------------------
+# Colores Google Calendar por categoría
+# ---------------------------------------------------------------------------
+
+CATEGORY_COLOR_MAP: Dict[str, str] = {
+    "🧠 Estudio":       "9",
+    "💪 Gym":           "2",
+    "🇩🇪 Alemania":    "5",
+    "🎥 Divulgación":   "6",
     "🔬 Investigación": "3",
-    "🌊 Sandbox": "8",
+    "🌊 Sandbox":       "8",
 }
 
 
-class ConfigAsistente:
-    """Centraliza las variables de entorno."""
+# ---------------------------------------------------------------------------
+# Configuración centralizada
+# ---------------------------------------------------------------------------
 
-    GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
-    GOOGLE_CALENDAR_IDS = os.environ.get("GOOGLE_CALENDAR_IDS")
-    GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+class Config:
+    GOOGLE_CREDENTIALS_JSON    = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    GOOGLE_CALENDAR_IDS        = os.environ.get("GOOGLE_CALENDAR_IDS")
+    GOOGLE_OAUTH_CLIENT_ID     = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
     GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
     GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
-    GOOGLE_OAUTH_TOKEN_URI = os.environ.get("GOOGLE_OAUTH_TOKEN_URI", "https://oauth2.googleapis.com/token")
+    GOOGLE_OAUTH_TOKEN_URI     = os.environ.get("GOOGLE_OAUTH_TOKEN_URI",
+                                                 "https://oauth2.googleapis.com/token")
 
-    NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
+    NOTION_API_KEY     = os.environ.get("NOTION_API_KEY")
     NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
-    NOTION_OUTPUT_PAGE_ID = os.environ.get("NOTION_OUTPUT_PAGE_ID")
-    NOTION_VERSION = os.environ.get("NOTION_VERSION", "2025-09-03")
-    TASK_HUB_URL = os.environ.get("TASK_HUB_URL", "https://www.notion.so/")
-    DIAGNOSTIC_MODE = os.environ.get("DIAGNOSTIC_MODE", "true").lower() == "true"
+    NOTION_VERSION     = os.environ.get("NOTION_VERSION", "2025-09-03")
+    TASK_HUB_URL       = os.environ.get("TASK_HUB_URL", "https://www.notion.so/")
 
-    SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
-    SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-    EMAIL_FROM = os.environ.get("EMAIL_FROM")
+    SMTP_SERVER    = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+    SMTP_PORT      = int(os.environ.get("SMTP_PORT", 587))
+    EMAIL_FROM     = os.environ.get("EMAIL_FROM")
     EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
-    EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_FROM)
+    EMAIL_TO       = os.environ.get("EMAIL_TO", os.environ.get("EMAIL_FROM"))
 
     TIMEZONE = os.environ.get("TIMEZONE", "America/Guayaquil")
 
-    @staticmethod
-    def get_calendar_ids() -> List[str]:
-        """Devuelve la lista de calendarios a consultar."""
-        raw_ids = ConfigAsistente.GOOGLE_CALENDAR_IDS
-        if raw_ids:
-            parsed = [item.strip() for item in raw_ids.split(",") if item.strip()]
-            if parsed:
-                return parsed
+    # Planificación
+    WORKDAY_START_HOUR  = 6
+    WORKDAY_END_HOUR    = 22
+    LUNCH_START_HOUR    = 13
+    LUNCH_END_HOUR      = 14
+    MIN_SESSION_MINUTES = 45   # Pilar 3: umbral mínimo por sesión
+    MAX_FOCUS_MINUTES   = 120  # tope de foco continuo (no se usa para bloquear, solo para info)
+
+    @classmethod
+    def calendar_ids(cls) -> List[str]:
+        raw = cls.GOOGLE_CALENDAR_IDS
+        if raw:
+            ids = [x.strip() for x in raw.split(",") if x.strip()]
+            if ids:
+                return ids
         return ["ALL"]
 
-    @staticmethod
-    def validate():
-        """Valida que todas las variables requeridas esten presentes."""
-        required = [
-            "NOTION_API_KEY",
-            "NOTION_DATABASE_ID",
-            "NOTION_OUTPUT_PAGE_ID",
-            "EMAIL_FROM",
-            "EMAIL_PASSWORD",
-            "EMAIL_TO",
-        ]
-        missing = [key for key in required if not getattr(ConfigAsistente, key)]
-
-        has_service_account = bool(ConfigAsistente.GOOGLE_CREDENTIALS_JSON)
-        has_user_oauth = all(
-            [
-                ConfigAsistente.GOOGLE_OAUTH_CLIENT_ID,
-                ConfigAsistente.GOOGLE_OAUTH_CLIENT_SECRET,
-                ConfigAsistente.GOOGLE_OAUTH_REFRESH_TOKEN,
-                ConfigAsistente.GOOGLE_OAUTH_TOKEN_URI,
-            ]
-        )
-
-        if not has_service_account and not has_user_oauth:
-            missing.append("GOOGLE_AUTH (service account u OAuth refresh token)")
-
+    @classmethod
+    def validate(cls) -> bool:
+        required = ["NOTION_API_KEY", "NOTION_DATABASE_ID",
+                    "EMAIL_FROM", "EMAIL_PASSWORD", "EMAIL_TO"]
+        missing = [k for k in required if not getattr(cls, k)]
+        has_oauth = all([cls.GOOGLE_OAUTH_CLIENT_ID, cls.GOOGLE_OAUTH_CLIENT_SECRET,
+                         cls.GOOGLE_OAUTH_REFRESH_TOKEN, cls.GOOGLE_OAUTH_TOKEN_URI])
+        has_sa = bool(cls.GOOGLE_CREDENTIALS_JSON)
+        if not has_oauth and not has_sa:
+            missing.append("GOOGLE_AUTH (OAuth o Service Account)")
         if missing:
-            logger.error("Variables de entorno faltantes: %s", ", ".join(missing))
+            logger.error("Variables faltantes: %s", ", ".join(missing))
             return False
-
-        logger.info("Configuracion validada correctamente")
+        logger.info("Configuracion validada")
         return True
 
 
-def normalize_notion_id(raw_id: Optional[str]) -> Optional[str]:
-    """Normaliza IDs de Notion removiendo formato de URL y guiones."""
-    if not raw_id:
-        return raw_id
+# ---------------------------------------------------------------------------
+# Helpers Notion
+# ---------------------------------------------------------------------------
 
-    cleaned = raw_id.strip()
-
-    if "/" in cleaned:
-        cleaned = cleaned.rstrip("/").split("/")[-1]
-    if "?" in cleaned:
-        cleaned = cleaned.split("?", 1)[0]
-    if "#" in cleaned:
-        cleaned = cleaned.split("#", 1)[0]
-
-    if "-" in cleaned and len(cleaned) > 32:
-        cleaned = cleaned.split("-")[-1]
-
-    return cleaned.replace("-", "")
+def _normalize_notion_id(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return raw
+    s = raw.strip()
+    for sep in ("?", "#"):
+        s = s.split(sep)[0]
+    if "/" in s:
+        s = s.rstrip("/").split("/")[-1]
+    if "-" in s and len(s) > 32:
+        s = s.split("-")[-1]
+    return s.replace("-", "")
 
 
-def parse_notion_error(response: requests.Response) -> str:
-    """Devuelve un mensaje breve de error para respuestas de Notion."""
+def _notion_error(resp: requests.Response) -> str:
     try:
-        payload = response.json()
+        d = resp.json()
+        return f"{d.get('code','')}: {d.get('message','')}" if d.get("code") else d.get("message", f"HTTP {resp.status_code}")
     except ValueError:
-        return response.text.strip() or f"HTTP {response.status_code}"
-
-    code = payload.get("code")
-    message = payload.get("message")
-    if code and message:
-        return f"{code}: {message}"
-    return message or code or f"HTTP {response.status_code}"
+        return resp.text.strip() or f"HTTP {resp.status_code}"
 
 
-def split_events_by_day(events: List[Dict], tz) -> Tuple[List[Dict], List[Dict]]:
-    """Separa eventos entre hoy y mañana segun la zona local."""
-    today = datetime.now(tz).date()
-    tomorrow = today + timedelta(days=1)
+# ---------------------------------------------------------------------------
+# Google Calendar Client
+# ---------------------------------------------------------------------------
 
-    today_events = []
-    tomorrow_events = []
+class CalendarClient:
+    SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-    for event in events:
-        event_day = event["start"].astimezone(tz).date()
-        if event_day == today:
-            today_events.append(event)
-        elif event_day == tomorrow:
-            tomorrow_events.append(event)
-
-    return today_events, tomorrow_events
-
-
-class CalendarSourceIntelligence:
-    """Clasifica calendarios y resuelve duplicados entre fuentes espejo."""
-
-    ACADEMIC_KEYWORDS = {
-        "class",
-        "clase",
-        "facultad",
-        "universidad",
-        "campus",
-        "horario",
-        "schedule",
-        "rotacion",
-        "rotation",
-        "hospital",
-        "medicina",
-    }
-    NOTION_KEYWORDS = {"notion", "task hub", "database", "calendar"}
-    PERSONAL_KEYWORDS = {"personal", "home", "casa", "vida"}
-
-    @staticmethod
-    def normalize_text(value: Optional[str]) -> str:
-        if not value:
-            return ""
-        return (
-            value.lower()
-            .replace("á", "a")
-            .replace("é", "e")
-            .replace("í", "i")
-            .replace("ó", "o")
-            .replace("ú", "u")
-        )
-
-    @classmethod
-    def classify_calendar(cls, calendar_meta: Dict) -> Dict:
-        """Clasifica un calendario por nombre/descripcion."""
-        title = calendar_meta.get("summary", "")
-        description = calendar_meta.get("description", "")
-        text = cls.normalize_text(f"{title} {description}")
-
-        source_type = "general"
-        score = 40
-
-        if any(keyword in text for keyword in cls.ACADEMIC_KEYWORDS):
-            source_type = "academic"
-            score = 100
-        elif any(keyword in text for keyword in cls.NOTION_KEYWORDS):
-            source_type = "notion_mirror"
-            score = 50
-        elif any(keyword in text for keyword in cls.PERSONAL_KEYWORDS):
-            source_type = "personal"
-            score = 70
-        elif calendar_meta.get("primary"):
-            source_type = "primary"
-            score = 80
-
-        return {
-            "calendar_name": title or calendar_meta.get("id", "Calendario"),
-            "source_type": source_type,
-            "source_score": score,
-        }
-
-    @classmethod
-    def event_fingerprint(cls, event: Dict) -> Tuple[str, str, str]:
-        summary = cls.normalize_text(event.get("summary", "")).strip()
-        summary = " ".join(summary.split())
-        start = event["start"].isoformat()
-        end = event["end"].isoformat()
-        return summary, start, end
-
-    @classmethod
-    def dedupe_events(cls, events: List[Dict]) -> List[Dict]:
-        """Elimina duplicados priorizando calendarios mas utiles."""
-        chosen: Dict[Tuple[str, str, str], Dict] = {}
-
-        for event in events:
-            key = cls.event_fingerprint(event)
-            current = chosen.get(key)
-            if not current:
-                chosen[key] = event
-                continue
-
-            if event.get("source_score", 0) > current.get("source_score", 0):
-                chosen[key] = event
-                continue
-
-            if (
-                event.get("source_score", 0) == current.get("source_score", 0)
-                and len(event.get("calendar_name", "")) < len(current.get("calendar_name", ""))
-            ):
-                chosen[key] = event
-
-        return sorted(chosen.values(), key=lambda item: item["start"])
-
-
-class GoogleCalendarIntegration:
-    """Obtiene eventos de Google Calendar para las proximas 24 horas."""
-
-    CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
-    CALENDAR_READONLY_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
-
-    def __init__(
-        self,
-        credentials_json: Optional[str] = None,
-        oauth_client_id: Optional[str] = None,
-        oauth_client_secret: Optional[str] = None,
-        oauth_refresh_token: Optional[str] = None,
-        oauth_token_uri: Optional[str] = None,
-    ):
+    def __init__(self):
+        cfg = Config
         try:
-            if oauth_client_id and oauth_client_secret and oauth_refresh_token and oauth_token_uri:
-                self.credentials, auth_mode = self._build_oauth_credentials(
-                    oauth_client_id=oauth_client_id,
-                    oauth_client_secret=oauth_client_secret,
-                    oauth_refresh_token=oauth_refresh_token,
-                    oauth_token_uri=oauth_token_uri,
+            if all([cfg.GOOGLE_OAUTH_CLIENT_ID, cfg.GOOGLE_OAUTH_CLIENT_SECRET,
+                    cfg.GOOGLE_OAUTH_REFRESH_TOKEN, cfg.GOOGLE_OAUTH_TOKEN_URI]):
+                creds = UserCredentials(
+                    token=None,
+                    refresh_token=cfg.GOOGLE_OAUTH_REFRESH_TOKEN,
+                    token_uri=cfg.GOOGLE_OAUTH_TOKEN_URI,
+                    client_id=cfg.GOOGLE_OAUTH_CLIENT_ID,
+                    client_secret=cfg.GOOGLE_OAUTH_CLIENT_SECRET,
+                    scopes=self.SCOPES,
                 )
+                creds.refresh(GoogleAuthRequest())
+                mode = "oauth_user"
             else:
-                credentials_dict = json.loads(credentials_json)
-                self.credentials = Credentials.from_service_account_info(
-                    credentials_dict,
-                    scopes=self.CALENDAR_SCOPES,
-                )
-                auth_mode = "service_account"
-
-            self.service = build("calendar", "v3", credentials=self.credentials)
-            self.last_calendar_snapshot: List[Dict] = []
-            logger.info("Google Calendar autenticado (%s)", auth_mode)
+                info = json.loads(cfg.GOOGLE_CREDENTIALS_JSON)
+                creds = Credentials.from_service_account_info(info, scopes=self.SCOPES)
+                mode = "service_account"
+            self._svc = build("calendar", "v3", credentials=creds)
+            logger.info("Google Calendar autenticado (%s)", mode)
         except Exception as exc:
             logger.error("Error autenticando Google Calendar: %s", exc)
             raise
 
-    def _build_oauth_credentials(
-        self,
-        oauth_client_id: str,
-        oauth_client_secret: str,
-        oauth_refresh_token: str,
-        oauth_token_uri: str,
-    ) -> Tuple[UserCredentials, str]:
-        """Construye credenciales OAuth con fallback al scope ya concedido."""
-        try:
-            credentials = UserCredentials(
-                token=None,
-                refresh_token=oauth_refresh_token,
-                token_uri=oauth_token_uri,
-                client_id=oauth_client_id,
-                client_secret=oauth_client_secret,
-                scopes=self.CALENDAR_SCOPES,
-            )
-            credentials.refresh(GoogleAuthRequest())
-            return credentials, "oauth_user"
-        except Exception as exc:
-            if "invalid_scope" not in str(exc):
-                raise
+    def list_calendars(self) -> Dict[str, Dict]:
+        items, token = [], None
+        while True:
+            resp = self._svc.calendarList().list(pageToken=token).execute()
+            items.extend(resp.get("items", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+        return {c["id"]: c for c in items}
 
-            logger.warning(
-                "El refresh token OAuth no acepta el scope calendar durante el refresh. "
-                "Se reintentara con los scopes originalmente concedidos."
-            )
-            credentials = UserCredentials(
-                token=None,
-                refresh_token=oauth_refresh_token,
-                token_uri=oauth_token_uri,
-                client_id=oauth_client_id,
-                client_secret=oauth_client_secret,
-            )
-            credentials.refresh(GoogleAuthRequest())
+    def get_events(self, calendar_ids: List[str], hours: int = 48) -> List[Dict]:
+        now     = datetime.now(timezone.utc)
+        horizon = now + timedelta(hours=hours)
+        avail   = self.list_calendars()
+        selected = list(avail.keys()) if calendar_ids == ["ALL"] else calendar_ids
 
-            granted_scopes = list(
-                getattr(credentials, "granted_scopes", None)
-                or getattr(credentials, "scopes", None)
-                or []
-            )
-            if self.CALENDAR_SCOPES[0] not in granted_scopes:
-                logger.warning(
-                    "El token OAuth actual no incluye permiso de escritura sobre Google Calendar. "
-                    "La lectura seguira funcionando, pero para crear eventos debes regenerar el refresh token "
-                    "con el scope https://www.googleapis.com/auth/calendar."
-                )
+        raw: List[Dict] = []
+        for cal_id in selected:
+            token = None
+            while True:
+                try:
+                    result = (
+                        self._svc.events()
+                        .list(
+                            calendarId=cal_id,
+                            timeMin=now.isoformat(),
+                            timeMax=horizon.isoformat(),
+                            singleEvents=True,
+                            orderBy="startTime",
+                            pageToken=token,
+                            fields="items(id,summary,start,end),nextPageToken",
+                        )
+                        .execute()
+                    )
+                except Exception as exc:
+                    logger.warning("Error leyendo calendario %s: %s", cal_id, exc)
+                    break
+                for ev in result.get("items", []):
+                    raw.append(self._normalize(ev, cal_id))
+                token = result.get("nextPageToken")
+                if not token:
+                    break
 
-            return credentials, "oauth_user_existing_scope"
+        deduped = self._dedupe(raw)
+        logger.info("%d eventos en proximas %dh (%d calendarios)", len(deduped), hours, len(selected))
+        return deduped
 
     @staticmethod
-    def _normalize_event_datetime(value: str, is_end: bool = False) -> datetime:
-        """Convierte date o dateTime de Google Calendar en datetime UTC-aware."""
-        if "T" in value:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    def _normalize(ev: Dict, cal_id: str) -> Dict:
+        def to_dt(val: str) -> datetime:
+            if "T" in val:
+                return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return datetime.fromisoformat(val).replace(tzinfo=timezone.utc)
 
-        base_date = datetime.fromisoformat(value)
-        if is_end:
-            return base_date.replace(tzinfo=timezone.utc)
-        return base_date.replace(tzinfo=timezone.utc)
-
-    @staticmethod
-    def _localize_iso_datetime(value: str, tz_name: str) -> str:
-        """Garantiza un datetime ISO 8601 aware en la zona configurada."""
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        local_tz = get_timezone(tz_name)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=local_tz)
-        else:
-            parsed = parsed.astimezone(local_tz)
-        return parsed.isoformat()
-
-    @staticmethod
-    def _build_event_payload(raw_event: Dict, calendar_id: str) -> Dict:
-        """Normaliza un evento de Google Calendar."""
-        start_raw = raw_event["start"].get("dateTime", raw_event["start"].get("date"))
-        end_raw = raw_event["end"].get("dateTime", raw_event["end"].get("date"))
-        is_all_day = "date" in raw_event["start"] and "dateTime" not in raw_event["start"]
-
-        start_dt = GoogleCalendarIntegration._normalize_event_datetime(start_raw, is_end=False)
-        end_dt = GoogleCalendarIntegration._normalize_event_datetime(end_raw, is_end=True)
-        duration_min = int((end_dt - start_dt).total_seconds() / 60)
-
+        s = ev["start"].get("dateTime", ev["start"].get("date"))
+        e = ev["end"].get("dateTime",   ev["end"].get("date"))
+        start_dt = to_dt(s)
+        end_dt   = to_dt(e)
         return {
-            "id": raw_event["id"],
-            "calendar_id": calendar_id,
-            "summary": raw_event.get("summary", "Evento sin titulo"),
+            "id": ev["id"],
+            "cal_id": cal_id,
+            "summary": ev.get("summary", "Sin titulo"),
             "start": start_dt,
-            "end": end_dt,
-            "duration_minutes": duration_min,
-            "is_all_day": is_all_day,
+            "end":   end_dt,
+            "duration_min": int((end_dt - start_dt).total_seconds() / 60),
+            "all_day": "date" in ev["start"] and "dateTime" not in ev["start"],
         }
 
-    def get_available_calendars(self) -> List[Dict]:
-        """Lista calendarios visibles para la cuenta/integracion."""
-        calendars = []
-        page_token = None
-
-        while True:
-            response = (
-                self.service.calendarList()
-                .list(pageToken=page_token)
-                .execute()
-            )
-            calendars.extend(response.get("items", []))
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
-
-        return calendars
-
-    def get_calendar_snapshot(self) -> List[Dict]:
-        """Devuelve el ultimo snapshot de calendarios clasificados."""
-        return self.last_calendar_snapshot
+    @staticmethod
+    def _dedupe(events: List[Dict]) -> List[Dict]:
+        seen: Dict[tuple, Dict] = {}
+        for ev in events:
+            key = (ev["summary"].lower().strip(), ev["start"].isoformat(), ev["end"].isoformat())
+            if key not in seen:
+                seen[key] = ev
+        return sorted(seen.values(), key=lambda x: x["start"])
 
     def create_event(
         self,
@@ -466,2232 +289,715 @@ class GoogleCalendarIntegration:
         start_iso: str,
         end_iso: str,
         description: str = "",
-        calendar_id: str = "primary",
-        color_id: str | None = None,
-    ) -> dict | None:
-        """Crea un evento en Google Calendar reutilizando la sesion autenticada."""
-        timezone_name = os.environ.get("TIMEZONE", "America/Guayaquil")
-        try:
-            event_body = {
-                "summary": title,
-                "start": {
-                    "dateTime": self._localize_iso_datetime(start_iso, timezone_name),
-                    "timeZone": timezone_name,
-                },
-                "end": {
-                    "dateTime": self._localize_iso_datetime(end_iso, timezone_name),
-                    "timeZone": timezone_name,
-                },
-                "description": description,
-            }
-            if color_id:
-                event_body["colorId"] = color_id
+        color_id: Optional[str] = None,
+        cal_id: str = "primary",
+    ) -> Optional[Dict]:
+        tz_name  = Config.TIMEZONE
+        local_tz = get_tz(tz_name)
 
-            created_event = (
-                self.service.events()
-                .insert(calendarId=calendar_id, body=event_body)
-                .execute()
-            )
-            logger.info("Evento creado en Google Calendar: %s", created_event.get("id"))
-            return created_event
-        except Exception as exc:
-            if "insufficient authentication scopes" in str(exc).lower():
-                logger.error(
-                    "No se pudo crear el evento porque el token OAuth actual no tiene scope de escritura. "
-                    "Regenera GOOGLE_OAUTH_REFRESH_TOKEN con acceso a Google Calendar."
-                )
-            logger.error("Error creando evento en Google Calendar: %s", exc)
-            return None
-
-    def get_events_horizon(self, calendar_ids: List[str], hours: int = 48) -> List[Dict]:
-        """Obtiene todos los eventos del horizonte solicitado para uno o varios calendarios."""
-        try:
-            now = datetime.now(timezone.utc)
-            end_time = now + timedelta(hours=hours)
-            events = []
-            available_calendars = {item["id"]: item for item in self.get_available_calendars()}
-            self.last_calendar_snapshot = []
-            for item in available_calendars.values():
-                enriched = {
-                    "id": item.get("id"),
-                    "summary": item.get("summary", item.get("id")),
-                    "primary": item.get("primary", False),
-                    **CalendarSourceIntelligence.classify_calendar(item),
-                }
-                self.last_calendar_snapshot.append(enriched)
-
-            if calendar_ids == ["ALL"]:
-                selected_calendar_ids = list(available_calendars.keys())
+        def localize(val: str) -> str:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=local_tz)
             else:
-                selected_calendar_ids = calendar_ids
+                dt = dt.astimezone(local_tz)
+            return dt.isoformat()
 
-            for calendar_id in selected_calendar_ids:
-                if calendar_id not in available_calendars and calendar_id != "primary":
-                    logger.warning("El calendario %s no aparece en calendarList; se intentara consultar igual.", calendar_id)
-
-                page_token = None
-                while True:
-                    events_result = (
-                        self.service.events()
-                        .list(
-                            calendarId=calendar_id,
-                            timeMin=now.isoformat(),
-                            timeMax=end_time.isoformat(),
-                            singleEvents=True,
-                            orderBy="startTime",
-                            pageToken=page_token,
-                            fields="items(id,summary,start,end),nextPageToken",
-                        )
-                        .execute()
-                    )
-
-                    for event in events_result.get("items", []):
-                        payload = self._build_event_payload(event, calendar_id)
-                        calendar_meta = available_calendars.get(calendar_id, {"id": calendar_id, "summary": calendar_id})
-                        payload.update(CalendarSourceIntelligence.classify_calendar(calendar_meta))
-                        events.append(payload)
-
-                    page_token = events_result.get("nextPageToken")
-                    if not page_token:
-                        break
-
-            normalized_events = CalendarSourceIntelligence.dedupe_events(events)
-
-            logger.info(
-                "%s eventos encontrados en proximas %sh desde %s calendario(s)",
-                len(normalized_events),
-                hours,
-                len(selected_calendar_ids),
-            )
-            for calendar_id in selected_calendar_ids:
-                logger.info("Calendario consultado: %s", calendar_id)
-
-            return normalized_events
-        except Exception as exc:
-            logger.error("Error obteniendo eventos: %s", exc)
-            return []
-
-
-class NotionIntegration:
-    """Consulta y actualiza Notion API."""
-
-    NOTION_API_URL = "https://api.notion.com/v1"
-
-    def __init__(self, api_key: str, notion_version: str):
-        self.api_key = api_key
-        self.notion_version = notion_version
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Notion-Version": notion_version,
-            "Content-Type": "application/json",
+        body: Dict = {
+            "summary": title,
+            "description": description,
+            "start": {"dateTime": localize(start_iso), "timeZone": tz_name},
+            "end":   {"dateTime": localize(end_iso),   "timeZone": tz_name},
         }
-        logger.info("Notion API inicializado con version %s", notion_version)
-
-    def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
-        response = requests.request(
-            method,
-            f"{self.NOTION_API_URL}/{endpoint}",
-            headers=self.headers,
-            timeout=20,
-            **kwargs,
-        )
-        return response
-
-    def _resolve_data_source_id(self, database_or_source_id: str) -> str:
-        """
-        Acepta un database_id o un data_source_id y devuelve el data_source_id real.
-        """
-        notion_id = normalize_notion_id(database_or_source_id)
-
-        db_response = self._request("GET", f"databases/{notion_id}")
-        if db_response.status_code == 200:
-            database = db_response.json()
-            data_sources = database.get("data_sources", [])
-            if data_sources:
-                resolved_id = data_sources[0]["id"]
-                logger.info("Database resuelta a data source: %s", resolved_id)
-                return resolved_id
-
-            logger.info(
-                "La database no devolvio data_sources; se reutiliza el ID original"
-            )
-            return notion_id
-
-        ds_response = self._request("GET", f"data_sources/{notion_id}")
-        if ds_response.status_code == 200:
-            logger.info("El ID recibido ya corresponde a un data source")
-            return notion_id
-
-        raise RuntimeError(
-            "No se pudo resolver el ID de Notion ni como database ni como data source. "
-            f"Database -> {parse_notion_error(db_response)} | "
-            f"Data source -> {parse_notion_error(ds_response)}"
-        )
-
-    def _get_data_source_schema(self, data_source_id: str) -> Dict:
-        """Recupera el esquema del data source."""
-        response = self._request("GET", f"data_sources/{data_source_id}")
-        response.raise_for_status()
-        return response.json().get("properties", {})
-
-    @staticmethod
-    def _extract_plain_text(rich_text_items: List[Dict]) -> str:
-        return "".join(item.get("plain_text", "") for item in rich_text_items).strip()
-
-    @staticmethod
-    def _normalize_label(value: str) -> str:
-        return (
-            value.lower()
-            .replace("á", "a")
-            .replace("é", "e")
-            .replace("í", "i")
-            .replace("ó", "o")
-            .replace("ú", "u")
-        )
-
-    def _find_property(
-        self,
-        properties: Dict,
-        expected_types: List[str],
-        preferred_names: List[str],
-    ) -> Tuple[Optional[str], Optional[Dict]]:
-        """Busca una propiedad por nombre preferido y luego por tipo."""
-        normalized_targets = [self._normalize_label(name) for name in preferred_names]
-
-        for name, config in properties.items():
-            if config.get("type") not in expected_types:
-                continue
-            if self._normalize_label(name) in normalized_targets:
-                return name, config
-
-        for name, config in properties.items():
-            if config.get("type") in expected_types:
-                return name, config
-
-        return None, None
-
-    @staticmethod
-    def _extract_numeric_property_value(prop_type: Optional[str], prop_value: Dict) -> Optional[float]:
-        """Extrae un valor numerico desde propiedades number o formula de Notion."""
-        if not prop_type:
+        if color_id:
+            body["colorId"] = color_id
+        try:
+            created = self._svc.events().insert(calendarId=cal_id, body=body).execute()
+            logger.info("Evento creado: %s", created.get("id"))
+            return created
+        except Exception as exc:
+            logger.error("Error creando evento: %s", exc)
             return None
-        if prop_type == "number":
-            return prop_value.get("number")
-        if prop_type == "formula":
-            formula = prop_value.get("formula") or {}
-            if formula.get("type") == "number":
-                return formula.get("number")
+
+
+# ---------------------------------------------------------------------------
+# Notion Client
+# ---------------------------------------------------------------------------
+
+class NotionClient:
+    BASE = "https://api.notion.com/v1"
+
+    def __init__(self):
+        self._h = {
+            "Authorization":  f"Bearer {Config.NOTION_API_KEY}",
+            "Notion-Version": Config.NOTION_VERSION,
+            "Content-Type":   "application/json",
+        }
+        logger.info("Notion API inicializado (v%s)", Config.NOTION_VERSION)
+
+    def _req(self, method: str, path: str, **kw) -> requests.Response:
+        return requests.request(method, f"{self.BASE}/{path}",
+                                headers=self._h, timeout=20, **kw)
+
+    def _resolve_ds(self, db_id: str) -> str:
+        nid = _normalize_notion_id(db_id)
+        r = self._req("GET", f"databases/{nid}")
+        if r.status_code == 200:
+            sources = r.json().get("data_sources", [])
+            if sources:
+                ds = sources[0]["id"]
+                logger.info("Data source: %s", ds)
+                return ds
+            return nid
+        r2 = self._req("GET", f"data_sources/{nid}")
+        if r2.status_code == 200:
+            return nid
+        raise RuntimeError(f"No se pudo resolver DB/DS. DB:{_notion_error(r)} DS:{_notion_error(r2)}")
+
+    @staticmethod
+    def _formula_number(prop: Dict) -> Optional[float]:
+        t = prop.get("type")
+        if t == "formula":
+            f = prop.get("formula") or {}
+            return f.get("number")
+        if t == "number":
+            return prop.get("number")
         return None
 
-    def _build_query_payload(self, properties: Dict) -> Dict:
-        """Construye un payload amplio; el filtrado fino se hace localmente para diagnostico."""
-        due_name, _ = self._find_property(
-            properties,
-            ["date"],
-            ["Due Date", "Fecha", "Fecha limite", "Vencimiento", "Deadline"],
-        )
+    @staticmethod
+    def _plain(items: List[Dict]) -> str:
+        return "".join(i.get("plain_text", "") for i in items).strip()
 
-        payload: Dict = {"page_size": 100}
-        if due_name:
-            payload["sorts"] = [
-                {"property": due_name, "direction": "ascending"},
-                {"timestamp": "last_edited_time", "direction": "descending"},
-            ]
-        else:
-            payload["sorts"] = [{"timestamp": "last_edited_time", "direction": "descending"}]
-        return payload
-
-    def _evaluate_task_inclusion(self, task: Dict) -> Tuple[bool, str]:
-        """Decide si la tarea entra al motor diario y explica el motivo."""
-        today = datetime.now().date()
-        status = self._normalize_label(task.get("status", ""))
-        due_date = task.get("due_date")
-        priority = self._normalize_label(task.get("priority", ""))
-        remaining_minutes = task.get("remaining_minutes")
-        progress_percent = task.get("progress_percent")
-        completed_flag = task.get("completed_flag", False)
-
-        completed_aliases = {"completado", "completed", "done", "hecho", "listo", "finalizado"}
-
-        # ------------------------------------------------------------------ #
-        # FIX #1: "En progreso" tiene prioridad absoluta sobre cualquier      #
-        # otro check. Se evalua ANTES de completed_flag y remaining_minutes.  #
-        # Esto evita que una tarea activa sea descartada porque su campo      #
-        # "Minutos Restantes" devuelve 0 o porque completed_flag se activó   #
-        # erroneamente durante la extraccion.                                 #
-        # ------------------------------------------------------------------ #
-        if status in {"en progreso", "in progress"}:
-            return True, "incluida: en progreso"
-
-        # Para tareas que NO estan en progreso aplicamos checks normales.
-        if completed_flag or status in completed_aliases:
-            return False, "descartada: ya completada"
-
-        # FIX #2: remaining_minutes == 0 solo descarta si ADEMAS el progreso
-        # confirma 100%. Un campo vacio o en 0 por formula sin calcular no
-        # debe ser motivo suficiente para descartar.
-        if (
-            remaining_minutes is not None
-            and remaining_minutes <= 0
-            and (progress_percent is None or progress_percent >= 100)
-        ):
-            return False, "descartada: sin minutos restantes"
-
-        if progress_percent is not None and progress_percent >= 100:
-            return False, "descartada: progreso al 100%"
-
-        if not due_date:
-            return False, "descartada: no tiene fecha limite"
-
-        try:
-            due = datetime.fromisoformat(due_date[:10]).date()
-        except ValueError:
-            return False, f"descartada: fecha invalida ({due_date})"
-
-        if due < today:
-            return True, "incluida: vencida"
-        if due == today:
-            return True, "incluida: vence hoy"
-        if due <= today + timedelta(days=3):
-            return True, f"incluida: proxima ventana ({due.isoformat()})"
-        if priority in {"alta", "urgente", "high", "critical", "media"}:
-            return True, f"incluida: prioridad alta aunque vence despues ({due.isoformat()})"
-        return False, f"descartada: vence mas adelante ({due.isoformat()})"
-
-    def _query_all_results(self, data_source_id: str, payload: Dict) -> List[Dict]:
-        """Consulta todas las paginas del data source con paginacion."""
-        url = f"data_sources/{data_source_id}/query"
-        all_results: List[Dict] = []
+    def get_pending_tasks(self, db_id: str) -> List[Dict]:
+        """
+        Lee todas las tareas con Status != Done.
+        Las fórmulas se leen directamente; nunca se recalculan (Pilar 1).
+        Ordena por Score Urgencia descendente (Pilar 2).
+        """
+        ds_id = self._resolve_ds(db_id)
+        payload = {
+            "page_size": 100,
+            "filter": {
+                "property": "Status",
+                "status": {"does_not_equal": "Done"},
+            },
+        }
+        pages: List[Dict] = []
         cursor = None
-
         while True:
-            request_payload = dict(payload)
+            body = dict(payload)
             if cursor:
-                request_payload["start_cursor"] = cursor
-
-            response = self._request("POST", url, json=request_payload)
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Notion devolvio {response.status_code} al consultar tareas: "
-                    f"{parse_notion_error(response)} | payload={request_payload}"
-                )
-
-            data = response.json()
-            all_results.extend(data.get("results", []))
+                body["start_cursor"] = cursor
+            r = self._req("POST", f"data_sources/{ds_id}/query", json=body)
+            if r.status_code >= 400:
+                raise RuntimeError(f"Error Notion: {_notion_error(r)}")
+            data = r.json()
+            for page in data.get("results", []):
+                task = self._parse(page)
+                if task:
+                    pages.append(task)
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
 
-        return all_results
+        # Pilar 2: Score Urgencia descendente
+        pages.sort(key=lambda t: t["score_urgencia"], reverse=True)
+        logger.info("%d tareas pendientes", len(pages))
+        for t in pages:
+            logger.info("  [%.0f] %s | sesion=%s min | restantes=%s min | status=%s",
+                        t["score_urgencia"], t["title"],
+                        t.get("session_duration"), t.get("tiempo_a_agendar"),
+                        t["status"])
+        return pages
 
-    _diag_count = 0  # contador de clase para limitar logs crudos
+    def _parse(self, page: Dict) -> Optional[Dict]:
+        props = page.get("properties", {})
 
-    def _extract_task_from_result(self, result: Dict, properties: Dict) -> Dict:
-        """Extrae una tarea adaptandose al esquema real del data source."""
-        props = result.get("properties", {})
+        title    = self._plain(props.get("Name", {}).get("title", [])) or "Sin titulo"
+        status   = (props.get("Status", {}).get("status") or {}).get("name", "Not started")
+        priority = (props.get("Priority", {}).get("select") or {}).get("name", "Media")
+        category = (props.get("Category", {}).get("select") or {}).get("name", "General")
+        contexto = (props.get("📍 Contexto", {}).get("select") or {}).get("name")
+        due_date = (props.get("Due Date", {}).get("date") or {}).get("start")
 
-        # LOG DIAGNOSTICO: imprime propiedades crudas de las primeras 3 tareas
-        NotionIntegration._diag_count += 1
-        if NotionIntegration._diag_count <= 3:
-            import json as _json
-            logger.info(
-                "RAW_PROPS[%s]: %s",
-                NotionIntegration._diag_count,
-                _json.dumps(
-                    {k: v for k, v in props.items()
-                     if k in ("Status", "Priority", "⏳ Minutos Restantes",
-                               "⏱️ Duración (min)", "🧩 Bloques Completados",
-                               "🔢 Total Bloques", "✅ Sincronizada", "Name")},
-                    ensure_ascii=False,
-                    default=str,
-                )[:800]
-            )
+        # ---- PILAR 1: campos de fórmula = solo lectura ----
 
-        title_name, _ = self._find_property(properties, ["title"], ["Name", "Nombre", "Tarea", "Task"])
-        due_name, _ = self._find_property(
-            properties,
-            ["date"],
-            ["Due Date", "Fecha", "Fecha limite", "Vencimiento", "Deadline"],
-        )
-        status_name, status_prop = self._find_property(
-            properties,
-            ["status", "select", "checkbox"],
-            ["Status", "Estado", "Situacion"],
-        )
-        priority_name, priority_prop = self._find_property(
-            properties,
-            ["select", "status", "multi_select"],
-            ["Priority", "Prioridad"],
-        )
-        category_name, category_prop = self._find_property(
-            properties,
-            ["select", "status", "multi_select"],
-            ["Category", "Categoria", "Area"],
-        )
-        duration_name, duration_prop = self._find_property(
-            properties,
-            ["number", "formula"],
-            [
-                "Duracion estimada",
-                "Duracion",
-                "Estimated Duration",
-                "Estimate",
-                "Minutos",
-                "Tiempo estimado",
-            ],
-        )
-        context_name, context_prop = self._find_property(
-            properties,
-            ["select", "status", "multi_select", "rich_text"],
-            ["Contexto", "Context", "Ubicacion", "Lugar"],
-        )
-        remaining_name, remaining_prop = self._find_property(
-            properties,
-            ["number", "formula"],
-            [
-                "Minutos restantes",
-                "⏳ Minutos Restantes",
-                "Tiempo restante",
-                "Remaining Minutes",
-                "Remaining Time",
-            ],
-        )
-        blocks_done_name, blocks_done_prop = self._find_property(
-            properties,
-            ["number"],
-            ["Bloques Completados", "🧩 Bloques Completados"],
-        )
-        total_blocks_name, total_blocks_prop = self._find_property(
-            properties,
-            ["number"],
-            ["Total Bloques", "🔢 Total Bloques"],
-        )
-        completed_minutes_name, completed_minutes_prop = self._find_property(
-            properties,
-            ["number", "formula"],
-            [
-                "Minutos completados",
-                "Minutos estudiados",
-                "Tiempo completado",
-                "Completed Minutes",
-                "Studied Minutes",
-            ],
-        )
-        progress_name, progress_prop = self._find_property(
-            properties,
-            ["number", "formula"],
-            [
-                "Progreso",
-                "Progreso %",
-                "Progress",
-                "Progress %",
-                "% completado",
-            ],
-        )
-        completed_name, completed_prop = self._find_property(
-            properties,
-            ["checkbox"],
-            ["Completada", "Completado", "Done", "Completed"],
-        )
+        # Duración total (number, escribible)
+        dur_prop = props.get("⏱️ Duración (min)", {})
+        duracion_min: Optional[int] = None
+        if dur_prop.get("type") == "number" and dur_prop.get("number") is not None:
+            duracion_min = int(dur_prop["number"])
 
-        title_items = props.get(title_name or "", {}).get("title", [])
-        title_text = self._extract_plain_text(title_items) or "Sin titulo"
+        # Minutos Restantes (fórmula, solo lectura)
+        val_r = self._formula_number(props.get("⏳ Minutos Restantes", {}))
+        minutos_restantes: Optional[int] = None
+        if val_r is not None:
+            minutos_restantes = max(int(val_r), 0)
 
-        status_value = "Por hacer"
-        if status_name and status_prop:
-            prop_type = status_prop.get("type")
-            status_data = props.get(status_name, {})
-            if prop_type == "status":
-                status_value = (status_data.get("status") or {}).get("name", "Por hacer")
-            elif prop_type == "select":
-                status_value = (status_data.get("select") or {}).get("name", "Por hacer")
-            elif prop_type == "checkbox":
-                status_value = "Completado" if status_data.get("checkbox") else "Por hacer"
+        # Total Bloques (fórmula, solo lectura) — Pilar 1: formula.number
+        val_tb = self._formula_number(props.get("🔢 Total Bloques", {}))
+        total_bloques: Optional[int] = None
+        if val_tb is not None and val_tb > 0:
+            total_bloques = int(val_tb)
 
-        due_value = None
-        if due_name:
-            due_value = (props.get(due_name, {}).get("date") or {}).get("start")
+        # Bloques Completados (number, escribible)
+        bc_prop = props.get("🧩 Bloques Completados", {})
+        bloques_completados: int = 0
+        if bc_prop.get("type") == "number" and bc_prop.get("number") is not None:
+            bloques_completados = int(bc_prop["number"])
 
-        priority_value = "Normal"
-        if priority_name and priority_prop:
-            prop_type = priority_prop.get("type")
-            priority_data = props.get(priority_name, {})
-            if prop_type == "status":
-                priority_value = (priority_data.get("status") or {}).get("name", "Normal")
-            elif prop_type == "select":
-                priority_value = (priority_data.get("select") or {}).get("name", "Normal")
-            elif prop_type == "multi_select":
-                items = priority_data.get("multi_select") or []
-                priority_value = items[0]["name"] if items else "Normal"
+        # Score Urgencia (fórmula, solo lectura) — clave de priorización
+        val_s = self._formula_number(props.get("🎯 Score Urgencia", {}))
+        score_urgencia: float = float(val_s) if val_s is not None else 0.0
 
-        category_value = "General"
-        if category_name and category_prop:
-            prop_type = category_prop.get("type")
-            category_data = props.get(category_name, {})
-            if prop_type == "status":
-                category_value = (category_data.get("status") or {}).get("name", "General")
-            elif prop_type == "select":
-                category_value = (category_data.get("select") or {}).get("name", "General")
-            elif prop_type == "multi_select":
-                items = category_data.get("multi_select") or []
-                category_value = items[0]["name"] if items else "General"
-
-        estimated_minutes = None
-        if duration_name and duration_prop:
-            estimated_minutes = self._extract_numeric_property_value(
-                duration_prop.get("type"),
-                props.get(duration_name, {}),
-            )
-            if estimated_minutes is not None:
-                estimated_minutes = int(estimated_minutes)
-
-        remaining_minutes = None
-        if remaining_name and remaining_prop:
-            remaining_minutes = self._extract_numeric_property_value(
-                remaining_prop.get("type"),
-                props.get(remaining_name, {}),
-            )
-        if remaining_minutes is not None:
-            remaining_minutes = max(int(remaining_minutes), 0)
-
-        blocks_done = None
-        if blocks_done_name and blocks_done_prop:
-            blocks_done = props.get(blocks_done_name, {}).get("number")
-            if blocks_done is not None:
-                blocks_done = int(blocks_done)
-
-        total_blocks = None
-        if total_blocks_name and total_blocks_prop:
-            total_blocks = props.get(total_blocks_name, {}).get("number")
-            if total_blocks is not None:
-                total_blocks = int(total_blocks)
-
-        completed_minutes = None
-        if completed_minutes_name and completed_minutes_prop:
-            completed_minutes = self._extract_numeric_property_value(
-                completed_minutes_prop.get("type"),
-                props.get(completed_minutes_name, {}),
-            )
-            if completed_minutes is not None:
-                completed_minutes = max(int(completed_minutes), 0)
-
-        progress_percent = None
-        if progress_name and progress_prop:
-            progress_percent = self._extract_numeric_property_value(
-                progress_prop.get("type"),
-                props.get(progress_name, {}),
-            )
-            if progress_percent is not None:
-                progress_percent = float(progress_percent)
-                if progress_percent <= 1:
-                    progress_percent *= 100
-                progress_percent = max(0.0, min(progress_percent, 100.0))
-
-        completed_flag = False
-        if completed_name and completed_prop:
-            completed_flag = bool(props.get(completed_name, {}).get("checkbox"))
-
-        if remaining_minutes is None and estimated_minutes is not None and completed_minutes is not None:
-            remaining_minutes = max(estimated_minutes - completed_minutes, 0)
-        if completed_minutes is None and estimated_minutes is not None and remaining_minutes is not None:
-            completed_minutes = max(estimated_minutes - remaining_minutes, 0)
-        if progress_percent is None and estimated_minutes and completed_minutes is not None:
-            progress_percent = min((completed_minutes / estimated_minutes) * 100, 100.0)
-
-        # ------------------------------------------------------------------ #
-        # REGLA DEFINITIVA: completed_flag lo decide SOLO el campo Status     #
-        # de Notion. Nunca se infiere desde campos numericos (remaining,      #
-        # progress, bloques) porque esos campos pueden estar desactualizados. #
-        # _evaluate_task_inclusion usa status directamente para Done/Not.     #
-        # ------------------------------------------------------------------ #
-        # completed_flag ya fue asignado arriba desde el checkbox si existe.
-        # No se modifica aqui.
-
-        context_value = None
-        if context_name and context_prop:
-            prop_type = context_prop.get("type")
-            context_data = props.get(context_name, {})
-            if prop_type == "status":
-                context_value = (context_data.get("status") or {}).get("name")
-            elif prop_type == "select":
-                context_value = (context_data.get("select") or {}).get("name")
-            elif prop_type == "multi_select":
-                items = context_data.get("multi_select") or []
-                context_value = items[0]["name"] if items else None
-            elif prop_type == "rich_text":
-                context_value = self._extract_plain_text(context_data.get("rich_text", [])) or None
-
-        return {
-            "id": result["id"],
-            "title": title_text,
-            "status": status_value,
-            "due_date": due_value,
-            "priority": priority_value,
-            "category": category_value,
-            "estimated_minutes": estimated_minutes,
-            "remaining_minutes": remaining_minutes,
-            "blocks_done": blocks_done,
-            "total_blocks": total_blocks,
-            "completed_minutes": completed_minutes,
-            "progress_percent": progress_percent,
-            "completed_flag": completed_flag,
-            "context": context_value,
-        }
-
-    def query_database(self, database_id: str) -> Tuple[List[Dict], Dict]:
-        """Consulta tareas del hub y devuelve diagnostico de filtrado."""
-        try:
-            data_source_id = self._resolve_data_source_id(database_id)
-            properties = self._get_data_source_schema(data_source_id)
-            payload = self._build_query_payload(properties)
-            raw_results = self._query_all_results(data_source_id, payload)
-
-            tasks = []
-            discarded = []
-            all_tasks = []
-            for result in raw_results:
-                task = self._extract_task_from_result(result, properties)
-                included, reason = self._evaluate_task_inclusion(task)
-                task["diagnostic_reason"] = reason
-                all_tasks.append(task)
-                if included:
-                    tasks.append(task)
-                else:
-                    discarded.append(task)
-
-            logger.info("%s tareas obtenidas de Notion", len(tasks))
-            logger.info("%s tareas descartadas por reglas de inclusion", len(discarded))
-            diagnostics = {
-                "total_tasks_seen": len(all_tasks),
-                "included_tasks": tasks,
-                "discarded_tasks": discarded,
-            }
-            return tasks, diagnostics
-        except Exception as exc:
-            logger.error("Error consultando Notion: %s", exc)
-            return [], {"total_tasks_seen": 0, "included_tasks": [], "discarded_tasks": []}
-
-    def _make_rich_text(self, text: str) -> List[Dict]:
-        return [{"type": "text", "text": {"content": text[:2000]}}]
-
-    def append_report_to_page(
-        self,
-        page_id: str,
-        suggestions: List[Dict],
-        free_slots: List[Dict],
-        tasks: List[Dict],
-        timestamp: datetime,
-        diagnostics: Optional[Dict] = None,
-        created_events: Optional[List[Dict]] = None,
-    ) -> bool:
-        """Agrega un reporte resumido a la pagina de salida."""
-        try:
-            normalized_page_id = normalize_notion_id(page_id)
-
-            page_response = self._request("GET", f"pages/{normalized_page_id}")
-            page_response.raise_for_status()
-
-            blocks = [
-                {"object": "block", "type": "divider", "divider": {}},
-                {
-                    "object": "block",
-                    "type": "heading_2",
-                    "heading_2": {
-                        "rich_text": self._make_rich_text(
-                            f"Sugerencias del {timestamp.strftime('%d/%m/%Y %H:%M')}"
-                        )
-                    },
-                },
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": self._make_rich_text(
-                            f"Tareas pendientes analizadas: {len(tasks)} | "
-                            f"Huecos detectados: {len(free_slots)} | "
-                            f"Sugerencias generadas: {len(suggestions)}"
-                        )
-                    },
-                },
-            ]
-
-            if suggestions:
-                blocks.append(
-                    {
-                        "object": "block",
-                        "type": "heading_3",
-                        "heading_3": {
-                            "rich_text": self._make_rich_text("Sugerencias principales")
-                        },
-                    }
-                )
-                for suggestion in suggestions[:5]:
-                    blocks_done = suggestion.get("blocks_done")
-                    total_blocks = suggestion.get("total_blocks")
-                    if blocks_done is not None and total_blocks is not None:
-                        next_block = blocks_done + 1
-                        block_label = f" — bloque {next_block}/{total_blocks}"
-                    else:
-                        block_label = ""
-                    line = (
-                        f"{suggestion['task_title']}{block_label} -> "
-                        f"{suggestion['slot_label']} | "
-                        f"{suggestion.get('split_note') + ' ' if suggestion.get('split_note') else ''}"
-                        f"{suggestion['reason']}"
-                    )
-                    blocks.append(
-                        {
-                            "object": "block",
-                            "type": "bulleted_list_item",
-                            "bulleted_list_item": {
-                                "rich_text": self._make_rich_text(line)
-                            },
-                        }
-                    )
-            else:
-                blocks.append(
-                    {
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": self._make_rich_text(
-                                "No se generaron sugerencias porque no hubo tareas priorizables o huecos suficientes."
-                            )
-                        },
-                    }
-                )
-
-            if created_events:
-                blocks.append(
-                    {
-                        "object": "block",
-                        "type": "heading_3",
-                        "heading_3": {
-                            "rich_text": self._make_rich_text("Eventos creados en Google Calendar")
-                        },
-                    }
-                )
-                for event in created_events:
-                    blocks.append(
-                        {
-                            "object": "block",
-                            "type": "bulleted_list_item",
-                            "bulleted_list_item": {
-                                "rich_text": self._make_rich_text(
-                                    f"{event['summary']} | {event['start']['dateTime']} → {event['end']['dateTime']}"
-                                )
-                            },
-                        }
-                    )
-
-            if free_slots:
-                blocks.append(
-                    {
-                        "object": "block",
-                        "type": "heading_3",
-                        "heading_3": {"rich_text": self._make_rich_text("Huecos detectados")},
-                    }
-                )
-                for slot in free_slots[:5]:
-                    blocks.append(
-                        {
-                            "object": "block",
-                            "type": "bulleted_list_item",
-                            "bulleted_list_item": {
-                                "rich_text": self._make_rich_text(
-                                    f"{slot['label']} ({slot['duration_minutes']} min)"
-                                )
-                            },
-                        }
-                    )
-
-            if diagnostics:
-                blocks.append(
-                    {
-                        "object": "block",
-                        "type": "heading_3",
-                        "heading_3": {"rich_text": self._make_rich_text("Diagnostico del motor")},
-                    }
-                )
-                blocks.append(
-                    {
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": self._make_rich_text(
-                                f"Eventos hoy: {diagnostics.get('today_events_count', 0)} | "
-                                f"Eventos mañana: {diagnostics.get('tomorrow_events_count', 0)} | "
-                                f"Tareas incluidas: {len(diagnostics.get('included_tasks', []))} | "
-                                f"Tareas descartadas: {len(diagnostics.get('discarded_tasks', []))} | "
-                                f"Tareas no agendadas: {len(diagnostics.get('unscheduled_tasks', []))}"
-                            )
-                        },
-                    }
-                )
-
-                for calendar in diagnostics.get("calendar_snapshot", [])[:8]:
-                    blocks.append(
-                        {
-                            "object": "block",
-                            "type": "bulleted_list_item",
-                            "bulleted_list_item": {
-                                "rich_text": self._make_rich_text(
-                                    f"Calendario: {calendar.get('calendar_name') or calendar.get('summary')} | "
-                                    f"tipo={calendar.get('source_type')} | primary={calendar.get('primary')}"
-                                )
-                            },
-                        }
-                    )
-
-                for task in diagnostics.get("discarded_tasks", [])[:5]:
-                    blocks.append(
-                        {
-                            "object": "block",
-                            "type": "bulleted_list_item",
-                            "bulleted_list_item": {
-                                "rich_text": self._make_rich_text(
-                                    f"Descartada: {task.get('title')} | {task.get('diagnostic_reason')}"
-                                )
-                            },
-                        }
-                    )
-
-                for task in diagnostics.get("unscheduled_tasks", [])[:5]:
-                    blocks.append(
-                        {
-                            "object": "block",
-                            "type": "bulleted_list_item",
-                            "bulleted_list_item": {
-                                "rich_text": self._make_rich_text(
-                                    f"No agendada: {task.get('task_title')} | {task.get('reason')}"
-                                )
-                            },
-                        }
-                    )
-
-            response = self._request(
-                "PATCH",
-                f"blocks/{normalized_page_id}/children",
-                json={"children": blocks},
-            )
-            response.raise_for_status()
-
-            logger.info("Pagina de Notion actualizada: %s", normalized_page_id)
-            return True
-        except Exception as exc:
-            logger.error("Error actualizando pagina Notion: %s", exc)
-            return False
-
-
-class MetricasDeValor:
-    """Genera justificaciones dinamicas basadas en palabras clave."""
-
-    KEYWORDS_MAPPING = {
-        "estudio": {
-            "keywords": [
-                "estudio",
-                "medicina",
-                "fisiologia",
-                "inmunologia",
-                "imagenologia",
-                "metodologia",
-                "psicologia",
-                "aprender",
-                "leer",
-                "investigacion",
-                "investigar",
-            ],
-            "metric": "Pico de alerta cognitiva para retencion profunda",
-        },
-        "gym": {
-            "keywords": [
-                "gym",
-                "entrenamiento",
-                "ejercicio",
-                "push",
-                "pull",
-                "legs",
-                "ppl",
-                "fuerza",
-                "hipertrofia",
-                "cardio",
-                "entrenar",
-            ],
-            "metric": "Ventana de fuerza maxima segun ritmos circadianos",
-        },
-        "general": {
-            "keywords": [],
-            "metric": "Optimizacion de flujo para evitar fatiga mental",
-        },
-    }
-
-    @staticmethod
-    def get_metric(task_title: str, category: str = "") -> str:
-        text_to_check = f"{task_title} {category}".lower()
-        for category_key, config in MetricasDeValor.KEYWORDS_MAPPING.items():
-            if category_key == "general":
-                continue
-            for keyword in config["keywords"]:
-                if keyword in text_to_check:
-                    return config["metric"]
-        return MetricasDeValor.KEYWORDS_MAPPING["general"]["metric"]
-
-
-class ExplicadorDeSugerencias:
-    """Construye razones mas concretas y menos genericas para cada recomendacion."""
-
-    @staticmethod
-    def build_reason(task: Dict, slot: Dict) -> str:
-        priority = task.get("priority", "Normal")
-        due_date = task.get("due_date")
-        status = (task.get("status", "") or "").lower()
-        if status in {"en progreso", "in progress"} and task.get("remaining_minutes") is not None:
-            estimated = task.get("remaining_minutes")
+        # ---- Pilar 3: duración de sesión = duración_total / total_bloques ----
+        if duracion_min is not None and total_bloques is not None and total_bloques > 0:
+            session_duration = duracion_min // total_bloques
+        elif duracion_min is not None:
+            session_duration = duracion_min
         else:
-            estimated = task.get("estimated_minutes")
+            session_duration = None
 
-        reasons = []
+        # Tiempo a agendar hoy
+        tiempo_a_agendar = minutos_restantes if minutos_restantes is not None else duracion_min
 
-        if priority in {"Urgente", "Alta", "Media"}:
-            reasons.append(f"prioridad {priority.lower()}")
-
-        if due_date:
-            reasons.append(f"vence el {due_date[:10]}")
-
-        if estimated:
-            reasons.append(f"requiere {estimated} min estimados")
-
-        if slot["duration_minutes"] >= 180:
-            reasons.append("bloque largo con pocas interrupciones")
-        elif slot["duration_minutes"] >= 90:
-            reasons.append("bloque suficiente para avanzar sin cambiar de contexto")
-        else:
-            reasons.append("bloque corto util para destrabar una parte concreta")
-
-        base = ", ".join(reasons[:3])
-        return f"Se recomienda este espacio porque combina {base}."
-
-
-class MotorDeSugerencias:
-    """Detecta huecos y propone tareas dentro de ellos."""
-
-    PRIORITY_SCORES = {"Urgente": 4, "Alta": 3, "Media": 2, "Normal": 2, "Baja": 1}
-    DEFAULT_TASK_MINUTES = {"Urgente": 90, "Alta": 60, "Media": 45, "Normal": 45, "Baja": 30}
-    MAX_FOCUS_BLOCK_MINUTES = 120
-    MAX_BREAK_BETWEEN_BLOCKS_MINUTES = 15
-    WORKDAY_START_HOUR = 6
-    WORKDAY_END_HOUR = 22
-    MIN_SLOT_MINUTES = 30
-    LUNCH_START_HOUR = 13
-    LUNCH_END_HOUR = 14
-    CAMPUS_KEYWORDS = {
-        "clase",
-        "class",
-        "facultad",
-        "universidad",
-        "hospital",
-        "rotacion",
-        "rotation",
-        "lab",
-        "laboratorio",
-        "seminario",
-        "curso",
-    }
-
-    @staticmethod
-    def _slot_label(start: datetime, end: datetime) -> str:
-        return f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}"
-
-    @staticmethod
-    def _normalize_text(value: Optional[str]) -> str:
-        if not value:
-            return ""
-        return (
-            value.lower()
-            .replace("á", "a")
-            .replace("é", "e")
-            .replace("í", "i")
-            .replace("ó", "o")
-            .replace("ú", "u")
-        )
-
-    @classmethod
-    def _is_campus_event(cls, event: Dict) -> bool:
-        if event.get("source_type") == "academic":
-            return True
-        text = cls._normalize_text(event.get("summary", ""))
-        return any(keyword in text for keyword in cls.CAMPUS_KEYWORDS)
-
-    @staticmethod
-    def _merge_intervals(intervals: List[Dict]) -> List[Dict]:
-        if not intervals:
-            return []
-
-        ordered = sorted(intervals, key=lambda item: item["start"])
-        merged = [ordered[0].copy()]
-
-        for interval in ordered[1:]:
-            current = merged[-1]
-            if interval["start"] <= current["end"]:
-                current["end"] = max(current["end"], interval["end"])
-                current["label"] = f"{current['label']} + {interval['label']}"
-            else:
-                merged.append(interval.copy())
-
-        return merged
-
-    @classmethod
-    def _infer_slot_context(
-        cls,
-        slot_start: datetime,
-        slot_end: datetime,
-        campus_events: List[Dict],
-    ) -> str:
-        previous_event = None
-        for event in campus_events:
-            if event["end_local"] <= slot_start:
-                previous_event = event
-            else:
-                break
-
-        next_event = next(
-            (event for event in campus_events if event["start_local"] >= slot_end),
-            None,
-        )
-
-        if previous_event and next_event:
-            gap_minutes = int(
-                (next_event["start_local"] - previous_event["end_local"]).total_seconds() / 60
-            )
-            if gap_minutes <= 240:
-                return "facultad"
-
-        if previous_event and not next_event:
-            return "casa"
-
-        if next_event and not previous_event:
-            return "casa"
-
-        return "flexible"
-
-    @classmethod
-    def _context_matches(cls, task_context: Optional[str], slot_context: str) -> bool:
-        normalized = cls._normalize_text(task_context)
-        if not normalized:
-            return True
-        if "casa" in normalized or "home" in normalized:
-            return slot_context in {"casa", "flexible"}
-        if "facultad" in normalized or "campus" in normalized or "universidad" in normalized:
-            return slot_context in {"facultad", "flexible"}
-        return True
-
-    @classmethod
-    def get_effective_minutes(cls, task: Dict) -> Optional[int]:
-        """Devuelve la duracion efectiva a programar segun el estado de la tarea."""
-        status = cls._normalize_text(task.get("status", ""))
-        remaining = task.get("remaining_minutes")
-        estimated = task.get("estimated_minutes")
-
-        if status in {"en progreso", "in progress"}:
-            # FIX #4: si remaining existe y es > 0 usalo.
-            # Si es 0 o None (campo vacio o formula sin calcular),
-            # cae a estimated como respaldo antes de devolver None.
-            if remaining is not None and remaining > 0:
-                return remaining
-            if estimated is not None and estimated > 0:
-                return estimated
+        if not tiempo_a_agendar or tiempo_a_agendar <= 0:
+            logger.debug("Descartada (sin tiempo): %s", title)
             return None
 
-        return estimated
+        return {
+            "id":                  page["id"],
+            "title":               title,
+            "status":              status,
+            "priority":            priority,
+            "category":            category,
+            "contexto":            contexto,
+            "due_date":            due_date,
+            "duracion_min":        duracion_min,
+            "minutos_restantes":   minutos_restantes,
+            "total_bloques":       total_bloques,
+            "bloques_completados": bloques_completados,
+            "session_duration":    session_duration,
+            "tiempo_a_agendar":    tiempo_a_agendar,
+            "score_urgencia":      score_urgencia,
+        }
 
-    @classmethod
-    def _build_session_lengths(cls, needed_minutes: int) -> List[int]:
-        """Divide tareas largas en bloques de foco mas realistas."""
-        if needed_minutes <= cls.MAX_FOCUS_BLOCK_MINUTES:
-            return [needed_minutes]
+    # ---- escritura — solo campos permitidos (Pilar 1) ----
 
-        remaining = needed_minutes
-        sessions = []
-        while remaining > cls.MAX_FOCUS_BLOCK_MINUTES:
-            sessions.append(cls.MAX_FOCUS_BLOCK_MINUTES)
-            remaining -= cls.MAX_FOCUS_BLOCK_MINUTES
-        if remaining:
-            sessions.append(remaining)
-        return sessions
+    def mark_in_progress(self, page_id: str) -> bool:
+        r = self._req("PATCH", f"pages/{_normalize_notion_id(page_id)}",
+                      json={"properties": {"Status": {"status": {"name": "In progress"}}}})
+        if r.status_code >= 400:
+            logger.error("Error Status→In progress %s: %s", page_id[:8], _notion_error(r))
+            return False
+        logger.info("Status→In progress: %s", page_id[:8])
+        return True
 
-    @classmethod
-    def _allocate_task_sessions(
-        cls,
-        available_slots: List[Dict],
-        task_context: Optional[str],
-        needed_minutes: int,
-    ) -> List[Dict]:
-        """Agenda el mayor avance posible de una tarea a traves de uno o varios huecos."""
-        remaining_minutes = needed_minutes
-        scheduled_sessions: List[Dict] = []
+    def update_bloques(self, page_id: str, bloques: int) -> bool:
+        r = self._req("PATCH", f"pages/{_normalize_notion_id(page_id)}",
+                      json={"properties": {"🧩 Bloques Completados": {"number": bloques}}})
+        if r.status_code >= 400:
+            logger.error("Error bloques %s: %s", page_id[:8], _notion_error(r))
+            return False
+        return True
 
-        while remaining_minutes > 0:
-            matching_slots = sorted(
-                [
-                    candidate
-                    for candidate in available_slots
-                    if cls._context_matches(task_context, candidate.get("context", "flexible"))
-                ],
-                key=lambda candidate: candidate["start"],
-            )
-            if not matching_slots:
+
+# ---------------------------------------------------------------------------
+# Huecos libres
+# ---------------------------------------------------------------------------
+
+CAMPUS_KW = {
+    "clase", "class", "facultad", "universidad", "hospital",
+    "rotacion", "rotation", "lab", "laboratorio", "seminario", "curso",
+}
+
+
+def _is_campus(ev: Dict) -> bool:
+    return any(k in ev["summary"].lower() for k in CAMPUS_KW)
+
+
+def _merge(intervals: List[Dict]) -> List[Dict]:
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda x: x["start"])
+    merged  = [ordered[0].copy()]
+    for iv in ordered[1:]:
+        cur = merged[-1]
+        if iv["start"] <= cur["end"]:
+            cur["end"] = max(cur["end"], iv["end"])
+        else:
+            merged.append(iv.copy())
+    return merged
+
+
+def _infer_ctx(slot_start, slot_end, campus) -> str:
+    prev = next((e for e in reversed(campus) if e["end_local"] <= slot_start), None)
+    nxt  = next((e for e in campus if e["start_local"] >= slot_end), None)
+    if prev and nxt:
+        gap = int((nxt["start_local"] - prev["end_local"]).total_seconds() / 60)
+        if gap <= 240:
+            return "facultad"
+    if prev and not nxt:
+        return "casa"
+    if nxt and not prev:
+        return "casa"
+    return "flexible"
+
+
+def find_free_slots(events: List[Dict], tz_name: str) -> List[Dict]:
+    tz    = get_tz(tz_name)
+    now   = datetime.now(tz)
+    today = now.date()
+
+    day_s = now.replace(hour=Config.WORKDAY_START_HOUR, minute=0, second=0, microsecond=0)
+    day_e = now.replace(hour=Config.WORKDAY_END_HOUR,   minute=0, second=0, microsecond=0)
+    if now > day_s:
+        day_s = now.replace(second=0, microsecond=0)
+
+    today_ev = []
+    for ev in events:
+        s = ev["start"].astimezone(tz)
+        e = ev["end"].astimezone(tz)
+        if s.date() != today and e.date() != today:
+            continue
+        if e <= day_s or s >= day_e:
+            continue
+        today_ev.append({**ev, "start_local": max(s, day_s), "end_local": min(e, day_e)})
+
+    today_ev.sort(key=lambda x: x["start_local"])
+    campus = [e for e in today_ev if _is_campus(e)]
+
+    occupied = [{"start": e["start_local"], "end": e["end_local"]} for e in today_ev]
+
+    lunch_s = now.replace(hour=Config.LUNCH_START_HOUR, minute=0, second=0, microsecond=0)
+    lunch_e = now.replace(hour=Config.LUNCH_END_HOUR,   minute=0, second=0, microsecond=0)
+    occupied.append({"start": lunch_s, "end": lunch_e})
+
+    if campus:
+        first, last = campus[0], campus[-1]
+        occupied.append({"start": max(day_s, first["start_local"] - timedelta(hours=1)),
+                         "end":   first["start_local"]})
+        occupied.append({"start": last["end_local"],
+                         "end":   min(day_e, last["end_local"] + timedelta(hours=1))})
+
+    merged = _merge([iv for iv in occupied if iv["end"] > day_s and iv["start"] < day_e])
+
+    slots, cursor = [], day_s
+    for iv in merged:
+        if iv["start"] > cursor:
+            dur = int((iv["start"] - cursor).total_seconds() / 60)
+            if dur >= Config.MIN_SESSION_MINUTES:
+                ctx = _infer_ctx(cursor, iv["start"], campus)
+                slots.append({
+                    "start": cursor, "end": iv["start"],
+                    "duration_min": dur,
+                    "label": f"{cursor.strftime('%H:%M')} - {iv['start'].strftime('%H:%M')}",
+                    "context": ctx,
+                })
+        cursor = max(cursor, iv["end"])
+
+    if cursor < day_e:
+        dur = int((day_e - cursor).total_seconds() / 60)
+        if dur >= Config.MIN_SESSION_MINUTES:
+            ctx = _infer_ctx(cursor, day_e, campus)
+            slots.append({
+                "start": cursor, "end": day_e,
+                "duration_min": dur,
+                "label": f"{cursor.strftime('%H:%M')} - {day_e.strftime('%H:%M')}",
+                "context": ctx,
+            })
+
+    return slots
+
+
+def _ctx_ok(task_ctx: Optional[str], slot_ctx: str) -> bool:
+    if not task_ctx:
+        return True
+    tc = task_ctx.lower()
+    if "casa" in tc or "home" in tc:
+        return slot_ctx in {"casa", "flexible"}
+    if any(k in tc for k in ("facultad", "campus", "universidad")):
+        return slot_ctx in {"facultad", "flexible"}
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Scheduler — Pilares 2, 3 y 5
+# ---------------------------------------------------------------------------
+
+class Scheduler:
+    """
+    Reglas de asignación:
+    - Toma tareas en orden de score_urgencia desc (ya vienen ordenadas).
+    - Para cada tarea, session_duration = duracion_min / total_bloques.
+    - Si session_duration < MIN_SESSION_MINUTES → omite la tarea (micro-bloque).
+    - Si una sesión no cabe en un hueco, pasa al siguiente hueco.
+    - Si no cabe en ningún hueco hoy, la tarea va a unscheduled.
+    - Si una tarea tiene más tiempo que el día: agenda solo lo que cabe hoy.
+    - Pilar 2: si la tarea de mayor score no cabe en un hueco, prueba las siguientes
+      (el hueco no se desperdicia).
+    """
+
+    def assign(self, tasks: List[Dict], free_slots: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        # Slots como lista mutable con capacidad restante
+        slots = [{"start": s["start"], "end": s["end"],
+                  "duration_min": s["duration_min"],
+                  "label": s["label"], "context": s["context"]}
+                 for s in free_slots]
+
+        scheduled:   List[Dict] = []
+        unscheduled: List[Dict] = []
+
+        for task in tasks:
+            sessions = self._fit(task, slots)
+            if sessions:
+                scheduled.extend(sessions)
+            else:
+                unscheduled.append(task)
+
+        return scheduled, unscheduled
+
+    def _fit(self, task: Dict, slots: List[Dict]) -> List[Dict]:
+        session_dur = task.get("session_duration")
+        if not session_dur:
+            logger.info("Sin session_duration: %s", task["title"])
+            return []
+
+        # Pilar 3: micro-bloque → omitir
+        if session_dur < Config.MIN_SESSION_MINUTES:
+            logger.info("Micro-bloque omitido (%d min < %d): %s",
+                        session_dur, Config.MIN_SESSION_MINUTES, task["title"])
+            return []
+
+        tiempo_restante   = task["tiempo_a_agendar"]
+        bloques_ya_hechos = task["bloques_completados"]
+        sessions: List[Dict] = []
+        bloque_num = bloques_ya_hechos  # se irá incrementando
+
+        for slot in slots:
+            if tiempo_restante <= 0:
                 break
+            if not _ctx_ok(task.get("contexto"), slot["context"]):
+                continue
+            if slot["duration_min"] < session_dur:
+                # No cabe ni una sesión aquí; pero no bloqueamos el slot para otras tareas
+                continue
 
-            slot = matching_slots[0]
-            available_slots.remove(slot)
+            # Cuántas sesiones completas caben en este slot
+            n_caben  = slot["duration_min"] // session_dur
+            n_necesarias = -(-tiempo_restante // session_dur)  # ceil
+            n_usar   = min(n_caben, n_necesarias)
 
             cursor = slot["start"]
-            remaining_capacity = slot["duration_minutes"]
-            sessions_in_current_slot = 0
-
-            while remaining_minutes > 0 and remaining_capacity >= cls.MIN_SLOT_MINUTES:
-                break_before_minutes = 0
-                if sessions_in_current_slot > 0:
-                    preferred_break = min(
-                        cls.MAX_BREAK_BETWEEN_BLOCKS_MINUTES,
-                        remaining_capacity - cls.MIN_SLOT_MINUTES,
-                    )
-                    if preferred_break <= 0:
-                        break
-                    cursor = cursor + timedelta(minutes=preferred_break)
-                    remaining_capacity -= preferred_break
-                    break_before_minutes = preferred_break
-
-                session_minutes = min(
-                    cls.MAX_FOCUS_BLOCK_MINUTES,
-                    remaining_minutes,
-                    remaining_capacity,
-                )
-                if session_minutes < cls.MIN_SLOT_MINUTES and remaining_minutes > cls.MIN_SLOT_MINUTES:
-                    if break_before_minutes:
-                        cursor = cursor - timedelta(minutes=break_before_minutes)
-                        remaining_capacity += break_before_minutes
+            for _ in range(n_usar):
+                if tiempo_restante <= 0:
+                    break
+                dur = min(session_dur, tiempo_restante)
+                if dur < Config.MIN_SESSION_MINUTES:
                     break
 
-                session_start = cursor
-                session_end = session_start + timedelta(minutes=session_minutes)
-                scheduled_sessions.append(
-                    {
-                        "slot_start": session_start.isoformat(),
-                        "slot_end": session_end.isoformat(),
-                        "slot_label": cls._slot_label(session_start, session_end),
-                        "slot_duration_minutes": session_minutes,
-                        "break_before_minutes": break_before_minutes,
-                    }
-                )
-
-                cursor = session_end
-                remaining_capacity -= session_minutes
-                remaining_minutes -= session_minutes
-                sessions_in_current_slot += 1
-
-                if remaining_minutes <= 0:
-                    break
-
-            if remaining_capacity >= cls.MIN_SLOT_MINUTES:
-                available_slots.append(
-                    {
-                        "start": cursor,
-                        "end": slot["end"],
-                        "duration_minutes": remaining_capacity,
-                        "label": cls._slot_label(cursor, slot["end"]),
-                        "context": slot.get("context", "flexible"),
-                    }
-                )
-                available_slots.sort(key=lambda candidate: candidate["start"])
-
-            if sessions_in_current_slot == 0:
-                break
-
-        session_total = len(scheduled_sessions)
-        for index, session in enumerate(scheduled_sessions, start=1):
-            session["session_index"] = index
-            session["session_total"] = session_total
-
-        return scheduled_sessions
-
-    @classmethod
-    def find_free_slots(
-        cls,
-        events: List[Dict],
-        tz_name: str,
-    ) -> List[Dict]:
-        """Calcula huecos libres dentro de la jornada del dia actual."""
-        tz = get_timezone(tz_name)
-        now_local = datetime.now(tz)
-        today = now_local.date()
-        day_start = now_local.replace(
-            hour=cls.WORKDAY_START_HOUR,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        day_end = now_local.replace(
-            hour=cls.WORKDAY_END_HOUR,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-
-        if now_local > day_start:
-            day_start = now_local.replace(second=0, microsecond=0)
-
-        localized_events = []
-        for event in events:
-            start_local = event["start"].astimezone(tz)
-            end_local = event["end"].astimezone(tz)
-
-            if start_local.date() != today and end_local.date() != today:
-                continue
-
-            if end_local <= day_start or start_local >= day_end:
-                continue
-
-            localized_events.append(
-                {
-                    **event,
-                    "start_local": max(start_local, day_start),
-                    "end_local": min(end_local, day_end),
-                }
-            )
-
-        localized_events.sort(key=lambda item: item["start_local"])
-        campus_events = [event for event in localized_events if cls._is_campus_event(event)]
-
-        occupied_intervals = [
-            {
-                "start": event["start_local"],
-                "end": event["end_local"],
-                "label": event["summary"],
-            }
-            for event in localized_events
-        ]
-
-        lunch_start = now_local.replace(
-            hour=cls.LUNCH_START_HOUR,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        lunch_end = now_local.replace(
-            hour=cls.LUNCH_END_HOUR,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        occupied_intervals.append(
-            {"start": lunch_start, "end": lunch_end, "label": "Bloque protegido de almuerzo"}
-        )
-
-        if campus_events:
-            first_class = campus_events[0]
-            last_class = campus_events[-1]
-            occupied_intervals.append(
-                {
-                    "start": max(day_start, first_class["start_local"] - timedelta(hours=1)),
-                    "end": first_class["start_local"],
-                    "label": "Buffer antes de primera clase",
-                }
-            )
-            occupied_intervals.append(
-                {
-                    "start": last_class["end_local"],
-                    "end": min(day_end, last_class["end_local"] + timedelta(hours=1)),
-                    "label": "Buffer despues de ultima clase",
-                }
-            )
-
-        merged_intervals = cls._merge_intervals(
-            [
-                interval
-                for interval in occupied_intervals
-                if interval["end"] > day_start and interval["start"] < day_end
-            ]
-        )
-
-        free_slots = []
-        cursor = day_start
-        for interval in merged_intervals:
-            if interval["start"] > cursor:
-                duration = int((interval["start"] - cursor).total_seconds() / 60)
-                if duration >= cls.MIN_SLOT_MINUTES:
-                    slot_end = interval["start"]
-                    free_slots.append(
-                        {
-                            "start": cursor,
-                            "end": slot_end,
-                            "duration_minutes": duration,
-                            "label": cls._slot_label(cursor, slot_end),
-                            "context": cls._infer_slot_context(cursor, slot_end, campus_events),
-                        }
-                    )
-            cursor = max(cursor, interval["end"])
-
-        if cursor < day_end:
-            duration = int((day_end - cursor).total_seconds() / 60)
-            if duration >= cls.MIN_SLOT_MINUTES:
-                free_slots.append(
-                    {
-                        "start": cursor,
-                        "end": day_end,
-                        "duration_minutes": duration,
-                        "label": cls._slot_label(cursor, day_end),
-                        "context": cls._infer_slot_context(cursor, day_end, campus_events),
-                    }
-                )
-
-        return free_slots
-
-    @classmethod
-    def generate(cls, tasks: List[Dict], free_slots: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Empareja tareas con huecos disponibles y devuelve diagnostico de descarte."""
-        ordered_tasks = sorted(
-            tasks,
-            key=lambda task: (
-                -cls.PRIORITY_SCORES.get(task.get("priority", "Normal"), 2),
-                task.get("due_date") or "9999-12-31",
-            ),
-        )
-
-        available_slots = free_slots.copy()
-        suggestions = []
-        unscheduled = []
-
-        for task in ordered_tasks:
-            needed_minutes = cls.get_effective_minutes(task) or cls.DEFAULT_TASK_MINUTES.get(
-                task.get("priority", "Normal"),
-                45,
-            )
-            matching_slots = [
-                candidate
-                for candidate in available_slots
-                if cls._context_matches(task.get("context"), candidate.get("context", "flexible"))
-            ]
-            if not matching_slots:
-                if not matching_slots:
-                    unscheduled.append(
-                        {
-                            "task_title": task["title"],
-                            "reason": "sin hueco compatible con su contexto",
-                            "required_minutes": needed_minutes,
-                            "context": task.get("context"),
-                        }
-                    )
-                continue
-
-            scheduled_sessions = cls._allocate_task_sessions(
-                available_slots,
-                task.get("context"),
-                needed_minutes,
-            )
-            if not scheduled_sessions:
-                max_minutes = max(candidate["duration_minutes"] for candidate in matching_slots)
-                unscheduled.append(
-                    {
-                        "task_title": task["title"],
-                        "reason": f"no cabe: necesita {needed_minutes} min y el mejor hueco compatible tiene {max_minutes} min",
-                        "required_minutes": needed_minutes,
-                        "context": task.get("context"),
-                    }
-                )
-                continue
-
-            primary_slot = {
-                "duration_minutes": matching_slots[0]["duration_minutes"],
-            }
-            reason = ExplicadorDeSugerencias.build_reason(task, primary_slot)
-            scheduled_start = datetime.fromisoformat(scheduled_sessions[0]["slot_start"])
-            scheduled_end = datetime.fromisoformat(scheduled_sessions[-1]["slot_end"])
-            scheduled_minutes = sum(session["slot_duration_minutes"] for session in scheduled_sessions)
-            remaining_minutes = max(needed_minutes - scheduled_minutes, 0)
-            total_break_minutes = sum(session.get("break_before_minutes", 0) for session in scheduled_sessions)
-            split_note = None
-            if remaining_minutes > 0:
-                split_note = (
-                    f"Hoy se programan {scheduled_minutes} de {needed_minutes} min en "
-                    f"{len(scheduled_sessions)} bloques priorizados"
-                )
-                if total_break_minutes > 0:
-                    split_note += f", con {total_break_minutes} min totales de pausa protegida"
-                split_note += f". Quedan {remaining_minutes} min pendientes para siguientes huecos."
-            elif len(scheduled_sessions) > 1:
-                split_note = (
-                    f"Se divide en {len(scheduled_sessions)} bloques para mantener foco sostenible "
-                    f"en una tarea de {needed_minutes} min"
-                )
-                if total_break_minutes > 0:
-                    split_note += f", con {total_break_minutes} min totales de pausa protegida."
-                else:
-                    split_note += "."
-            suggestions.append(
-                {
-                    "task_id": task["id"],
+                sess_end = cursor + timedelta(minutes=dur)
+                bloque_num += 1
+                sessions.append({
+                    "task_id":    task["id"],
                     "task_title": task["title"],
-                    "category": task.get("category", "General"),
-                    "priority": task.get("priority", "Normal"),
-                    "context": task.get("context"),
-                    "blocks_done": task.get("blocks_done"),
-                    "total_blocks": task.get("total_blocks"),
-                    "slot_label": " | ".join(session["slot_label"] for session in scheduled_sessions),
-                    "slot_start": scheduled_start.isoformat(),
-                    "slot_end": scheduled_end.isoformat(),
-                    "slot_duration_minutes": scheduled_minutes,
-                    "slot_duration": scheduled_minutes,
-                    "available_window_minutes": sum(session["slot_duration_minutes"] for session in scheduled_sessions),
-                    "scheduled_span_minutes": int((scheduled_end - scheduled_start).total_seconds() / 60),
-                    "split_sessions": scheduled_sessions,
-                    "split_note": split_note,
-                    "break_between_sessions_minutes": total_break_minutes,
-                    "required_minutes": needed_minutes,
-                    "estimated_total_minutes": task.get("estimated_minutes"),
-                    "reason": reason,
-                    "remaining_minutes": remaining_minutes,
-                    "progress_percent": task.get("progress_percent"),
-                }
-            )
+                    "category":   task["category"],
+                    "priority":   task["priority"],
+                    "contexto":   task.get("contexto"),
+                    "score":      task["score_urgencia"],
+                    "start":      cursor,
+                    "end":        sess_end,
+                    "duration_min": dur,
+                    "label": f"{cursor.strftime('%H:%M')} - {sess_end.strftime('%H:%M')}",
+                    "bloque_numero": bloque_num,
+                    "total_bloques": task["total_bloques"],
+                    "bloques_completados_finales": bloque_num,
+                })
+                cursor = sess_end
+                tiempo_restante -= dur
 
-        return suggestions, unscheduled
+            # Reducir capacidad del slot
+            usados = n_usar * session_dur
+            slot["start"]        = slot["start"] + timedelta(minutes=usados)
+            slot["duration_min"] -= usados
+
+        return sessions
 
 
-class EmailConstructor:
-    """Construye email HTML con sugerencias."""
+# ---------------------------------------------------------------------------
+# Email Builder
+# ---------------------------------------------------------------------------
 
+class EmailBuilder:
     @staticmethod
-    def _build_daily_insight(
-        tasks: List[Dict],
-        free_slots: List[Dict],
-        suggestions: List[Dict],
+    def build(
+        scheduled:   List[Dict],
+        unscheduled: List[Dict],
+        free_slots:  List[Dict],
+        all_events:  List[Dict],
+        timestamp:   datetime,
+        tz_name:     str,
+        hub_url:     str,
     ) -> str:
-        """Genera una frase breve con valor agregado."""
-        if suggestions and free_slots:
-            best = suggestions[0]
-            longest_slot = max(free_slots, key=lambda slot: slot["duration_minutes"])
-            return (
-                f"Hoy tienes una ventana clara de {longest_slot['duration_minutes']} minutos. "
-                f"El mejor movimiento es enfocar primero '{best['task_title']}' en el bloque {best['slot_label']}, "
-                f"alineado con su necesidad real de {best.get('required_minutes', best.get('slot_duration_minutes', best['slot_duration']))} minutos."
-            )
+        tz       = get_tz(tz_name)
+        local_ts = timestamp.astimezone(tz).strftime("%d/%m/%Y %H:%M")
+        today    = datetime.now(tz).date()
+        tomorrow = today + timedelta(days=1)
 
-        if free_slots:
-            longest_slot = max(free_slots, key=lambda slot: slot["duration_minutes"])
-            return (
-                f"Tu mayor activo hoy es un bloque libre de {longest_slot['duration_minutes']} minutos "
-                f"entre {longest_slot['label']}. Conviene reservarlo para trabajo de alta concentracion."
-            )
+        today_ev    = [e for e in all_events if e["start"].astimezone(tz).date() == today]
+        tomorrow_ev = [e for e in all_events if e["start"].astimezone(tz).date() == tomorrow]
 
-        if tasks:
-            return (
-                "Hoy el sistema detecta poco margen libre. La prioridad no es agregar mas trabajo, "
-                "sino proteger energia y ejecutar solo lo esencial."
-            )
+        # Agrupar sesiones por tarea
+        grouped: Dict[str, List[Dict]] = {}
+        for s in scheduled:
+            grouped.setdefault(s["task_title"], []).append(s)
 
-        return (
-            "Tu dia luce liviano. Este es un buen momento para adelantar una tarea importante antes "
-            "de que se acumule carga el resto de la semana."
-        )
+        # Cards de sesiones
+        cards_html = ""
+        for title, sessions in list(grouped.items())[:6]:
+            f = sessions[0]
+            pc = {"Alta": "#ef4444", "Media": "#f97316", "Baja": "#64748b"}.get(f["priority"], "#2563eb")
+            nums = [str(s["bloque_numero"]) for s in sessions] if f["total_bloques"] else []
+            bloque_str = f"Bloque(s) {', '.join(nums)}/{f['total_bloques']}" if nums else ""
+            labels = " | ".join(s["label"] for s in sessions)
+            total_min = sum(s["duration_min"] for s in sessions)
+            cards_html += f"""
+            <tr><td style="padding-bottom:14px;">
+              <div style="background:#f8fbff;border:1px solid #dbeafe;border-radius:18px;padding:18px 22px;">
+                <div style="font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:{pc};margin-bottom:8px;">{f['priority']} · {f['category']}</div>
+                <div style="font-size:17px;font-weight:700;color:#0f172a;margin-bottom:6px;">{title}</div>
+                <div style="font-size:14px;color:#334155;margin-bottom:4px;">{labels} ({total_min} min)</div>
+                {f'<div style="font-size:13px;color:#64748b;">{bloque_str}</div>' if bloque_str else ""}
+              </div>
+            </td></tr>"""
 
-    @staticmethod
-    def _build_tomorrow_note(events: List[Dict], tz) -> str:
-        """Genera una nota corta de anticipacion para el dia siguiente."""
-        tomorrow = datetime.now(tz).date() + timedelta(days=1)
-        tomorrow_events = [
-            event for event in events
-            if event["start"].astimezone(tz).date() == tomorrow
-        ]
+        # Sin hueco
+        unsch_html = ""
+        for t in unscheduled[:5]:
+            unsch_html += f"""
+            <tr><td style="padding-bottom:10px;">
+              <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:14px;padding:12px 18px;">
+                <div style="font-size:14px;font-weight:600;color:#7c2d12;">{t['title']}</div>
+                <div style="font-size:12px;color:#9a3412;">Sin hueco · Score {t['score_urgencia']:.0f} · Sesion {t.get('session_duration','?')} min</div>
+              </div>
+            </td></tr>"""
 
-        if len(tomorrow_events) >= 5:
-            return f"Mañana se perfila como un dia cargado: ya hay {len(tomorrow_events)} eventos en agenda. Conviene cerrar hoy con descanso y dejar claro el primer bloque de accion."
-        if len(tomorrow_events) >= 2:
-            return f"Mañana ya tiene {len(tomorrow_events)} compromisos visibles. Vale la pena dejar preparada desde hoy tu tarea de apertura."
-        if len(tomorrow_events) == 1:
-            return "Mañana empieza con baja friccion. Si dejas una prioridad bien definida hoy, puedes entrar en ritmo rapido."
-        return "Mañana todavia luce flexible. Eso te da margen para proteger un bloque profundo desde temprano."
+        # Agenda hoy
+        ag_hoy = ""
+        for ev in today_ev[:8]:
+            s = ev["start"].astimezone(tz).strftime("%H:%M")
+            e = ev["end"].astimezone(tz).strftime("%H:%M")
+            ag_hoy += f"""<tr>
+              <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;"><strong>{s}</strong> → <strong>{e}</strong></td>
+              <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;">{ev['summary']}</td>
+              <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">{ev['duration_min']} min</td>
+            </tr>"""
 
-    @staticmethod
-    def build_html(
-        tasks: List[Dict],
-        events: List[Dict],
-        free_slots: List[Dict],
-        suggestions: List[Dict],
-        timestamp: datetime,
-        tz_name: str,
-        task_hub_url: str,
-    ) -> str:
-        critical_tasks = [task for task in tasks if task.get("priority") in ["Alta", "Urgente", "Media"]]
-        local_tz = get_timezone(tz_name)
-        date_str = timestamp.astimezone(local_tz).strftime("%d/%m/%Y %H:%M")
-        today_events, tomorrow_events = split_events_by_day(events, local_tz)
+        # Agenda mañana
+        ag_man = ""
+        for ev in tomorrow_ev[:6]:
+            s = ev["start"].astimezone(tz).strftime("%H:%M")
+            e = ev["end"].astimezone(tz).strftime("%H:%M")
+            ag_man += f"""<tr>
+              <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;"><strong>{s}</strong> → <strong>{e}</strong></td>
+              <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;">{ev['summary']}</td>
+              <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">{ev['duration_min']} min</td>
+            </tr>"""
 
-        total_minutes = sum(event["duration_minutes"] for event in events)
-        top_suggestion = suggestions[0] if suggestions else None
-        daily_insight = EmailConstructor._build_daily_insight(tasks, free_slots, suggestions)
-        tomorrow_note = EmailConstructor._build_tomorrow_note(events, local_tz)
-        big_three = (critical_tasks or tasks)[:3]
+        total_min_agendados = sum(s["duration_min"] for s in scheduled)
 
-        suggestion_cards_html = ""
-        for suggestion in suggestions[:4]:
-            priority = suggestion.get("priority", "Normal")
-            priority_color = {
-                "Urgente": "#ef4444",
-                "Alta": "#f97316",
-                "Media": "#f59e0b",
-                "Normal": "#2563eb",
-                "Baja": "#64748b",
-            }.get(priority, "#2563eb")
-            split_note_html = ""
-            if suggestion.get("split_note"):
-                split_note_html = (
-                    '<div style="font-size:13px; color:#7c2d12; margin-bottom:8px; font-weight:600;">'
-                    f"{suggestion['split_note']}"
-                    "</div>"
-                )
-            suggestion_cards_html += f"""
-            <tr>
-                <td style="padding-bottom: 14px;">
-                    <div style="background:#f8fbff; border:1px solid #dbeafe; border-radius:18px; padding:20px 22px;">
-                        <div style="font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color:{priority_color}; margin-bottom:10px;">
-                            {priority}
-                        </div>
-                        <div style="font-size:18px; line-height:1.35; font-weight:700; color:#0f172a; margin-bottom:8px;">
-                            {suggestion['task_title']}
-                        </div>
-                        <div style="font-size:14px; color:#334155; margin-bottom:8px;">
-                            Recomendado para {suggestion['slot_label']} ({suggestion.get('slot_duration_minutes', suggestion['slot_duration'])} min programados)
-                        </div>
-                        <div style="font-size:13px; color:#0f172a; margin-bottom:8px; font-weight:600;">
-                            Tiempo a programar ahora: {suggestion.get('required_minutes', 'N/D')} min
-                        </div>
-                        {f"<div style='font-size:13px; color:#334155; margin-bottom:8px;'>Estimacion total original: {suggestion['estimated_total_minutes']} min</div>" if suggestion.get('estimated_total_minutes') and suggestion.get('estimated_total_minutes') != suggestion.get('required_minutes') else ""}
-                        {split_note_html}
-                        <div style="font-size:13px; color:#64748b; line-height:1.6;">
-                            {suggestion['reason']}
-                        </div>
-                    </div>
-                </td>
-            </tr>
-            """
+        return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;line-height:1.6;color:#0f172a;
+     background:linear-gradient(180deg,#eaf4ff 0%,#f8fafc 48%,#f4f0ff 100%);margin:0;padding:0;}}
+.wrap{{max-width:720px;margin:0 auto;padding:24px 16px 40px;}}
+.hero{{background:radial-gradient(circle at top left,#cfe7ff 0%,#fff 38%,#f8fafc 100%);
+      border:1px solid #bfdbfe;border-radius:28px;padding:32px 28px;
+      box-shadow:0 18px 40px rgba(15,23,42,.08);margin-bottom:18px;}}
+.panel{{background:rgba(255,255,255,.96);border:1px solid #cbd5e1;border-radius:24px;
+        padding:22px;box-shadow:0 12px 30px rgba(15,23,42,.05);margin-bottom:18px;}}
+.sec{{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:#64748b;margin:0 0 12px;}}
+table{{width:100%;border-collapse:collapse;font-size:13px;}}
+th{{background:#f8fafc;text-align:left;padding:10px 12px;color:#334155;border-bottom:1px solid #e2e8f0;}}
+.mc{{background:#fff;border:1px solid #cbd5e1;border-radius:16px;padding:16px;}}
+.mv{{font-size:24px;font-weight:700;color:#0f172a;margin-bottom:4px;}}
+.ml{{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div style="display:inline-block;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;
+                color:#2563eb;background:#eff6ff;border:1px solid #bfdbfe;border-radius:999px;
+                padding:5px 10px;margin-bottom:16px;">Asistente diario</div>
+    <h1 style="font-size:32px;line-height:1.1;letter-spacing:-1px;margin:0 0 8px;color:#0f172a;">Plan del dia listo.</h1>
+    <p style="margin:0;font-size:14px;color:#475569;">Sesiones ordenadas por Score de Urgencia · {local_ts}</p>
+    <table role="presentation" style="margin-top:22px;">
+      <tr>
+        <td style="width:33%;padding-right:8px;vertical-align:top;">
+          <div class="mc"><div class="mv">{len(grouped)}</div><div class="ml">Tareas agendadas</div></div></td>
+        <td style="width:33%;padding:0 4px;vertical-align:top;">
+          <div class="mc"><div class="mv">{total_min_agendados}</div><div class="ml">Min programados</div></div></td>
+        <td style="width:33%;padding-left:8px;vertical-align:top;">
+          <div class="mc"><div class="mv">{len(unscheduled)}</div><div class="ml">Sin hueco hoy</div></div></td>
+      </tr>
+    </table>
+  </div>
 
-        gaps_cards_html = ""
-        for slot in free_slots[:4]:
-            slot_kind = "Bloque profundo" if slot["duration_minutes"] >= 90 else "Bloque rapido"
-            gaps_cards_html += f"""
-            <td style="padding:0 8px 12px 8px; vertical-align:top;">
-                <div style="background:#fff7ed; border:1px solid #fdba74; border-radius:18px; padding:18px;">
-                    <div style="font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:1px; color:#3b82f6; margin-bottom:8px;">
-                        {slot_kind}
-                    </div>
-                    <div style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:6px;">
-                        {slot['label']}
-                    </div>
-                    <div style="font-size:13px; color:#64748b;">
-                        {slot['duration_minutes']} minutos disponibles
-                    </div>
-                </div>
-            </td>
-            """
+  <div class="panel">
+    <p class="sec">Sesiones del dia</p>
+    <table role="presentation">
+      {cards_html if cards_html else '<tr><td><div style="padding:20px;color:#64748b;text-align:center;">Sin sesiones programadas.</div></td></tr>'}
+    </table>
+  </div>
 
-        tasks_html = ""
-        for task in big_three:
-            priority = task.get("priority", "Normal")
-            priority_color = {
-                "Urgente": "#ef4444",
-                "Alta": "#f97316",
-                "Media": "#f59e0b",
-                "Normal": "#2563eb",
-                "Baja": "#64748b",
-            }.get(priority, "#2563eb")
-            metric = MetricasDeValor.get_metric(task["title"], task.get("category", ""))
-            tasks_html += f"""
-            <tr>
-                <td style="padding: 0 0 12px 0;">
-                    <div style="background:#f5f3ff; border:1px solid #c4b5fd; border-radius:16px; padding:16px 18px;">
-                        <div style="font-size:16px; font-weight:700; color:#0f172a; margin-bottom:6px;">
-                            {task['title']}
-                        </div>
-                        <div style="font-size:13px; color:{priority_color}; font-weight:700; margin-bottom:4px;">
-                            Prioridad: {priority}
-                        </div>
-                        <div style="font-size:13px; color:#64748b; line-height:1.5;">
-                            {metric}
-                        </div>
-                    </div>
-                </td>
-            </tr>
-            """
+  {'''<div class="panel"><p class="sec">Tareas sin hueco hoy</p><table role="presentation">''' + unsch_html + '''</table></div>''' if unsch_html else ""}
 
-        time_blocks_html = ""
-        for event in today_events[:6]:
-            start_time = event["start"].astimezone(local_tz).strftime("%H:%M")
-            end_time = event["end"].astimezone(local_tz).strftime("%H:%M")
-            metric = MetricasDeValor.get_metric(event["summary"], "Calendario")
-            source_label = event.get("calendar_name") or event.get("calendar_id", "")
-            if event.get("source_type") == "academic":
-                source_label = f"Académico · {source_label}"
-            elif event.get("source_type") == "notion_mirror":
-                source_label = f"Notion mirror · {source_label}"
-            elif event.get("source_type") == "personal":
-                source_label = f"Personal · {source_label}"
+  <div class="panel">
+    <p class="sec">Agenda de hoy</p>
+    <table>
+      <thead><tr><th>Hora</th><th>Evento</th><th>Duracion</th></tr></thead>
+      <tbody>{ag_hoy if ag_hoy else '<tr><td colspan="3" style="padding:14px;text-align:center;color:#334155;">Sin eventos.</td></tr>'}</tbody>
+    </table>
+  </div>
 
-            time_blocks_html += f"""
-            <tr>
-                <td style="padding: 12px; border-bottom: 1px solid #e0e0e0;">
-                    <strong>{start_time}</strong> → <strong>{end_time}</strong>
-                </td>
-                <td style="padding: 12px; border-bottom: 1px solid #e0e0e0;">
-                    {event['summary']}
-                    <div style="font-size:11px; color:#64748b; margin-top:4px;">Fuente: {source_label}</div>
-                </td>
-                <td style="padding: 12px; border-bottom: 1px solid #e0e0e0; text-align: center;">
-                    {event['duration_minutes']} min
-                </td>
-                <td style="padding: 12px; border-bottom: 1px solid #e0e0e0; font-size: 12px; color: #666;">
-                    {metric}
-                </td>
-            </tr>
-            """
+  <div class="panel">
+    <p class="sec">Agenda de manana</p>
+    <table>
+      <thead><tr><th>Hora</th><th>Evento</th><th>Duracion</th></tr></thead>
+      <tbody>{ag_man if ag_man else '<tr><td colspan="3" style="padding:14px;text-align:center;color:#334155;">Sin eventos.</td></tr>'}</tbody>
+    </table>
+  </div>
 
-        tomorrow_blocks_html = ""
-        for event in tomorrow_events[:6]:
-            start_time = event["start"].astimezone(local_tz).strftime("%H:%M")
-            end_time = event["end"].astimezone(local_tz).strftime("%H:%M")
-            source_label = event.get("calendar_name") or event.get("calendar_id", "")
-            if event.get("source_type") == "academic":
-                source_label = f"Académico · {source_label}"
-            elif event.get("source_type") == "notion_mirror":
-                source_label = f"Notion mirror · {source_label}"
-            elif event.get("source_type") == "personal":
-                source_label = f"Personal · {source_label}"
-            tomorrow_blocks_html += f"""
-            <tr>
-                <td style="padding: 12px; border-bottom: 1px solid #cbd5e1;">
-                    <strong>{start_time}</strong> → <strong>{end_time}</strong>
-                </td>
-                <td style="padding: 12px; border-bottom: 1px solid #cbd5e1; color:#0f172a;">
-                    {event['summary']}
-                    <div style="font-size:11px; color:#64748b; margin-top:4px;">Fuente: {source_label}</div>
-                </td>
-                <td style="padding: 12px; border-bottom: 1px solid #cbd5e1; text-align: center; color:#334155;">
-                    {event['duration_minutes']} min
-                </td>
-            </tr>
-            """
+  <div style="text-align:center;margin-top:20px;">
+    <a href="{hub_url}" style="display:inline-block;background:#0f172a;color:#fff;text-decoration:none;
+                               font-weight:700;font-size:14px;padding:13px 22px;border-radius:14px;
+                               box-shadow:0 10px 22px rgba(15,23,42,.15);">Abrir Task Hub</a>
+  </div>
+  <div style="text-align:center;color:#94a3b8;font-size:12px;padding-top:12px;">
+    Asistente · {len(scheduled)} sesiones · {len(all_events)} eventos en calendario
+  </div>
+</div>
+</body>
+</html>"""
 
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="es">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #0f172a;
-                    background: linear-gradient(180deg, #eaf4ff 0%, #f8fafc 48%, #f4f0ff 100%);
-                    margin: 0;
-                    padding: 0;
-                }}
-                .container {{
-                    max-width: 720px;
-                    margin: 0 auto;
-                    background-color: transparent;
-                    border-radius: 0;
-                    overflow: hidden;
-                }}
-                .shell {{
-                    padding: 28px 18px 40px 18px;
-                }}
-                .hero {{
-                    background: radial-gradient(circle at top left, #cfe7ff 0%, #ffffff 38%, #f8fafc 100%);
-                    border: 1px solid #bfdbfe;
-                    border-radius: 28px;
-                    padding: 34px 30px 28px 30px;
-                    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
-                    margin-bottom: 18px;
-                }}
-                .eyebrow {{
-                    display: inline-block;
-                    font-size: 11px;
-                    font-weight: 700;
-                    letter-spacing: 1.2px;
-                    text-transform: uppercase;
-                    color: #2563eb;
-                    background: #eff6ff;
-                    border: 1px solid #bfdbfe;
-                    border-radius: 999px;
-                    padding: 6px 10px;
-                    margin-bottom: 18px;
-                }}
-                .hero h1 {{
-                    font-size: 34px;
-                    line-height: 1.1;
-                    letter-spacing: -1px;
-                    margin: 0 0 10px 0;
-                    color: #0f172a;
-                }}
-                .hero p {{
-                    margin: 0;
-                    font-size: 15px;
-                    color: #475569;
-                }}
-                .section-title {{
-                    font-size: 12px;
-                    font-weight: 700;
-                    text-transform: uppercase;
-                    letter-spacing: 1.2px;
-                    color: #64748b;
-                    margin: 0 0 12px 0;
-                }}
-                .panel {{
-                    background: rgba(255,255,255,0.96);
-                    border: 1px solid #cbd5e1;
-                    border-radius: 24px;
-                    padding: 24px;
-                    box-shadow: 0 12px 30px rgba(15, 23, 42, 0.05);
-                    margin-bottom: 18px;
-                }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                    font-size: 13px;
-                }}
-                th {{
-                    background: #f8fafc;
-                    text-align: left;
-                    padding: 12px;
-                    color: #334155;
-                    border-bottom: 1px solid #e2e8f0;
-                }}
-                .footer {{
-                    padding: 10px 18px 0 18px;
-                    text-align: center;
-                    color: #64748b;
-                    font-size: 12px;
-                }}
-                .metric-card {{
-                    background: #ffffff;
-                    border: 1px solid #cbd5e1;
-                    border-radius: 18px;
-                    padding: 18px;
-                }}
-                .metric-value {{
-                    font-size: 26px;
-                    font-weight: 700;
-                    line-height: 1.1;
-                    color: #0f172a;
-                    margin-bottom: 6px;
-                }}
-                .metric-label {{
-                    font-size: 12px;
-                    color: #64748b;
-                    text-transform: uppercase;
-                    letter-spacing: 1px;
-                }}
-                @media only screen and (max-width: 640px) {{
-                    .shell {{
-                        padding: 14px 10px 28px 10px !important;
-                    }}
-                    .hero {{
-                        padding: 24px 18px 20px 18px !important;
-                        border-radius: 22px !important;
-                    }}
-                    .hero h1 {{
-                        font-size: 28px !important;
-                    }}
-                    .panel {{
-                        padding: 18px !important;
-                        border-radius: 20px !important;
-                    }}
-                    .metric-card {{
-                        padding: 14px !important;
-                    }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="shell">
-                    <div class="hero">
-                        <div class="eyebrow">Asistente diario</div>
-                        <h1>Tu agenda ya tiene una mejor version.</h1>
-                        <p>Resumen premium de tareas, huecos disponibles y recomendaciones accionables para hoy.</p>
-                        <p style="margin-top:10px; font-size:13px; color:#64748b;">{date_str}</p>
 
-                        <table role="presentation" style="margin-top:24px;">
-                            <tr>
-                                <td style="width:33.33%; padding-right:8px; vertical-align:top;">
-                                    <div class="metric-card">
-                                        <div class="metric-value">{len(tasks)}</div>
-                                        <div class="metric-label">Tareas pendientes</div>
-                                    </div>
-                                </td>
-                                <td style="width:33.33%; padding:0 4px; vertical-align:top;">
-                                    <div class="metric-card">
-                                        <div class="metric-value">{len(free_slots)}</div>
-                                        <div class="metric-label">Huecos detectados</div>
-                                    </div>
-                                </td>
-                                <td style="width:33.33%; padding-left:8px; vertical-align:top;">
-                                    <div class="metric-card">
-                                        <div class="metric-value">{total_minutes}</div>
-                                        <div class="metric-label">Minutos agendados</div>
-                                    </div>
-                                </td>
-                            </tr>
-                        </table>
-                    </div>
-
-                    <div class="panel">
-                        <div class="section-title">Insight del dia</div>
-                        <div style="background:#dcfce7; border:1px solid #4ade80; border-radius:20px; padding:20px 22px;">
-                            <div style="font-size:20px; line-height:1.4; font-weight:700; color:#0f172a; margin-bottom:8px;">
-                                {daily_insight}
-                            </div>
-                            <div style="font-size:13px; color:#64748b;">
-                                El valor de Asistente no es recordarte tareas: es señalar el mejor momento para ejecutarlas.
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="panel">
-                        <div class="section-title">Sugerencia principal</div>
-                        <div style="background:#0f172a; border-radius:22px; padding:24px; color:#ffffff; border:1px solid #1d4ed8;">
-                            <div style="font-size:12px; text-transform:uppercase; letter-spacing:1.2px; color:#bfdbfe; margin-bottom:10px; font-weight:700;">
-                                Hoja de ruta sugerida
-                            </div>
-                            <div style="font-size:24px; line-height:1.2; font-weight:700; margin-bottom:10px; color:#ffffff;">
-                                {top_suggestion['task_title'] if top_suggestion else 'Analizando tu flujo optimo...'}
-                            </div>
-                            <div style="font-size:14px; line-height:1.6; color:#e2e8f0;">
-                                {f"Bloque recomendado: {top_suggestion['slot_label']} ({top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration'])} min programados) para una tarea estimada en {top_suggestion.get('required_minutes', top_suggestion.get('slot_duration_minutes', top_suggestion['slot_duration']))} min. {top_suggestion['split_note'] + ' ' if top_suggestion.get('split_note') else ''}{top_suggestion['reason']}" if top_suggestion else 'Hoy no se encontraron cruces fuertes entre tareas y disponibilidad, pero el sistema sigue monitoreando tus huecos.'}
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="panel">
-                        <div class="section-title">Sugerencias priorizadas</div>
-                        <table role="presentation">
-                            {suggestion_cards_html if suggestion_cards_html else '<tr><td><div style="background:#ffffff; border:1px dashed #cbd5e1; border-radius:18px; padding:20px; color:#64748b;">No se encontraron emparejamientos entre tareas y huecos disponibles.</div></td></tr>'}
-                        </table>
-                    </div>
-
-                    <div class="panel">
-                        <div class="section-title">Disponibilidad del dia</div>
-                        <table role="presentation">
-                            <tr>
-                            {gaps_cards_html if gaps_cards_html else '<td><div style="background:#fff7ed; border:1px dashed #fdba74; border-radius:18px; padding:20px; color:#7c2d12;">Sin bloques libres detectados hoy.</div></td>'}
-                        </tr>
-                    </table>
-                </div>
-
-                    <div class="panel">
-                        <div class="section-title">The Big Three</div>
-                        <table role="presentation">
-                            {tasks_html if tasks_html else '<tr><td><div style="background:#f5f3ff; border:1px dashed #a78bfa; border-radius:18px; padding:20px; color:#5b21b6;">No hay objetivos prioritarios pendientes para hoy.</div></td></tr>'}
-                        </table>
-                    </div>
-
-                    <div class="panel">
-                        <div class="section-title">Agenda de hoy</div>
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Hora</th>
-                                    <th>Actividad</th>
-                                    <th>Duracion</th>
-                                    <th>Valor estrategico</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {time_blocks_html if time_blocks_html else '<tr><td colspan="4" style="padding: 16px; text-align:center; color:#334155; background:#ffffff;">Sin eventos programados para hoy.</td></tr>'}
-                            </tbody>
-                        </table>
-                    </div>
-
-                    <div class="panel">
-                        <div class="section-title">Agenda de mañana</div>
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Hora</th>
-                                    <th>Actividad</th>
-                                    <th>Duracion</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {tomorrow_blocks_html if tomorrow_blocks_html else '<tr><td colspan="3" style="padding: 16px; text-align:center; color:#334155; background:#ffffff;">No hay clases o eventos agendados para mañana dentro del horizonte actual.</td></tr>'}
-                            </tbody>
-                        </table>
-                    </div>
-
-                    <div class="panel">
-                        <div class="section-title">Anticipacion para mañana</div>
-                        <div style="background:#f5f3ff; border:1px solid #c4b5fd; border-radius:20px; padding:18px 20px; font-size:14px; color:#334155;">
-                            {tomorrow_note}
-                        </div>
-                    </div>
-
-                    <div style="text-align:center; margin-top:22px;">
-                        <a href="{task_hub_url}" style="display:inline-block; background:#0f172a; color:#ffffff; text-decoration:none; font-weight:700; font-size:15px; padding:14px 22px; border-radius:14px; box-shadow:0 10px 22px rgba(15,23,42,0.15);">
-                            Abrir Task Hub
-                        </a>
-                    </div>
-                </div>
-                <div class="footer">
-                    Enviado por <strong>Asistente</strong> | Tareas: {len(tasks)} | Eventos: {len(events)} | Huecos: {len(free_slots)}
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        return html
-
+# ---------------------------------------------------------------------------
+# Email Sender
+# ---------------------------------------------------------------------------
 
 class EmailSender:
-    """Envia emails via Gmail SMTP."""
-
     @staticmethod
-    def send(
-        smtp_server: str,
-        smtp_port: int,
-        email_from: str,
-        password: str,
-        email_to: str,
-        subject: str,
-        html_content: str,
-    ) -> bool:
+    def send(subject: str, html: str) -> bool:
         try:
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject
-            msg["From"] = email_from
-            msg["To"] = email_to
-            msg.attach(MIMEText(html_content, "html", "utf-8"))
-
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
-                server.starttls()
-                server.login(email_from, password)
-                server.send_message(msg)
-
-            logger.info("Email enviado a: %s", email_to)
+            msg["From"]    = Config.EMAIL_FROM
+            msg["To"]      = Config.EMAIL_TO
+            msg.attach(MIMEText(html, "html", "utf-8"))
+            with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as srv:
+                srv.starttls()
+                srv.login(Config.EMAIL_FROM, Config.EMAIL_PASSWORD)
+                srv.send_message(msg)
+            logger.info("Email enviado a %s", Config.EMAIL_TO)
             return True
         except Exception as exc:
             logger.error("Error enviando email: %s", exc)
             return False
 
 
-class DiagnosticReporter:
-    """Construye y emite reportes de diagnostico para logs y Notion."""
-
-    @staticmethod
-    def build(
-        calendar_snapshot: List[Dict],
-        events: List[Dict],
-        tasks_diagnostics: Dict,
-        unscheduled_tasks: List[Dict],
-        tz_name: str,
-    ) -> Dict:
-        tz = get_timezone(tz_name)
-        today_events, tomorrow_events = split_events_by_day(events, tz)
-
-        events_by_calendar: Dict[str, Dict] = {}
-        for event in events:
-            calendar_name = event.get("calendar_name") or event.get("calendar_id", "Calendario")
-            bucket = events_by_calendar.setdefault(
-                calendar_name,
-                {
-                    "source_type": event.get("source_type", "general"),
-                    "today_count": 0,
-                    "tomorrow_count": 0,
-                },
-            )
-            event_day = event["start"].astimezone(tz).date()
-            if event_day == datetime.now(tz).date():
-                bucket["today_count"] += 1
-            elif event_day == datetime.now(tz).date() + timedelta(days=1):
-                bucket["tomorrow_count"] += 1
-
-        return {
-            "calendar_snapshot": calendar_snapshot,
-            "events_by_calendar": events_by_calendar,
-            "today_events_count": len(today_events),
-            "tomorrow_events_count": len(tomorrow_events),
-            "included_tasks": tasks_diagnostics.get("included_tasks", []),
-            "discarded_tasks": tasks_diagnostics.get("discarded_tasks", []),
-            "unscheduled_tasks": unscheduled_tasks,
-        }
-
-    @staticmethod
-    def log(report: Dict):
-        logger.info("=== DIAGNOSTICO: CALENDARIOS DETECTADOS ===")
-        if not report.get("calendar_snapshot"):
-            logger.warning(
-                "No se detectaron calendarios visibles. Si estas usando service account, probablemente no tiene calendarios compartidos. Para modo producto, conviene OAuth de usuario."
-            )
-        for calendar in report.get("calendar_snapshot", []):
-            logger.info(
-                "calendar=%s | type=%s | primary=%s | score=%s",
-                calendar.get("calendar_name") or calendar.get("summary"),
-                calendar.get("source_type"),
-                calendar.get("primary"),
-                calendar.get("source_score"),
-            )
-
-        logger.info("=== DIAGNOSTICO: EVENTOS POR CALENDARIO ===")
-        if not report.get("events_by_calendar"):
-            logger.warning("No se registraron eventos en el horizonte consultado.")
-        for name, stats in report.get("events_by_calendar", {}).items():
-            logger.info(
-                "calendar=%s | type=%s | hoy=%s | manana=%s",
-                name,
-                stats.get("source_type"),
-                stats.get("today_count"),
-                stats.get("tomorrow_count"),
-            )
-
-        logger.info("=== DIAGNOSTICO: TAREAS INCLUIDAS ===")
-        for task in report.get("included_tasks", []):
-            logger.info(
-                "task=%s | reason=%s | due=%s | context=%s | estimated=%s",
-                task.get("title"),
-                task.get("diagnostic_reason"),
-                task.get("due_date"),
-                task.get("context"),
-                task.get("estimated_minutes"),
-            )
-
-        logger.info("=== DIAGNOSTICO: TAREAS DESCARTADAS ===")
-        for task in report.get("discarded_tasks", []):
-            logger.info(
-                "task=%s | reason=%s | due=%s | status=%s",
-                task.get("title"),
-                task.get("diagnostic_reason"),
-                task.get("due_date"),
-                task.get("status"),
-            )
-
-        logger.info("=== DIAGNOSTICO: TAREAS NO AGENDADAS ===")
-        for task in report.get("unscheduled_tasks", []):
-            logger.info(
-                "task=%s | reason=%s | required=%s | context=%s",
-                task.get("task_title"),
-                task.get("reason"),
-                task.get("required_minutes"),
-                task.get("context"),
-            )
-
+# ---------------------------------------------------------------------------
+# Orquestador
+# ---------------------------------------------------------------------------
 
 class Asistente:
-    """Orquesta todo el flujo del sistema."""
-
-    def __init__(self, config: ConfigAsistente):
-        self.config = config
-        self.events: List[Dict] = []
-        self.tasks: List[Dict] = []
-        self.free_slots: List[Dict] = []
-        self.suggestions: List[Dict] = []
-        self.diagnostics: Dict = {}
-
     def run(self) -> int:
-        try:
-            print("\n" + "=" * 70)
-            print("🤖 ASISTENTE - Motor de Productividad")
-            print(f"Ejecucion: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-            print("=" * 70 + "\n")
+        print("\n" + "=" * 70)
+        print("ASISTENTE - Motor de Productividad")
+        print(f"Ejecucion: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        print("=" * 70 + "\n")
 
-            if not self.config.validate():
-                return 1
-
-            logger.info("Obtener eventos de Google Calendar...")
-            calendar = GoogleCalendarIntegration(
-                credentials_json=self.config.GOOGLE_CREDENTIALS_JSON,
-                oauth_client_id=self.config.GOOGLE_OAUTH_CLIENT_ID,
-                oauth_client_secret=self.config.GOOGLE_OAUTH_CLIENT_SECRET,
-                oauth_refresh_token=self.config.GOOGLE_OAUTH_REFRESH_TOKEN,
-                oauth_token_uri=self.config.GOOGLE_OAUTH_TOKEN_URI,
-            )
-            self.events = calendar.get_events_horizon(
-                self.config.get_calendar_ids(),
-                hours=48,
-            )
-
-            logger.info("Obtener tareas de Notion...")
-            notion = NotionIntegration(
-                self.config.NOTION_API_KEY,
-                self.config.NOTION_VERSION,
-            )
-            self.tasks, tasks_diagnostics = notion.query_database(self.config.NOTION_DATABASE_ID)
-
-            logger.info("Calcular huecos y sugerencias...")
-            self.free_slots = MotorDeSugerencias.find_free_slots(
-                self.events,
-                self.config.TIMEZONE,
-            )
-            self.suggestions, unscheduled_tasks = MotorDeSugerencias.generate(
-                self.tasks,
-                self.free_slots,
-            )
-            created_events: List[Dict] = []
-            planned_events = 0
-            for suggestion in self.suggestions:
-                color_id = CATEGORY_COLOR_MAP.get(suggestion["category"])
-                split_sessions = suggestion.get("split_sessions") or [
-                    {
-                        "slot_start": suggestion["slot_start"],
-                        "slot_end": suggestion["slot_end"],
-                        "slot_duration_minutes": suggestion.get(
-                            "slot_duration_minutes",
-                            suggestion["slot_duration"],
-                        ),
-                        "session_index": 1,
-                        "session_total": 1,
-                    }
-                ]
-                planned_events += len(split_sessions)
-
-                for session in split_sessions:
-                    block_info = ""
-                    if suggestion.get("blocks_done") is not None and suggestion.get("total_blocks") is not None:
-                        next_block = suggestion["blocks_done"] + 1
-                        block_info = f"\nBloque: {next_block}/{suggestion['total_blocks']}"
-                    if session["session_total"] > 1:
-                        title = (
-                            f"[Asistente] {suggestion['task_title']} "
-                            f"({session['session_index']}/{session['session_total']})"
-                        )
-                        division_note = (
-                            f"Division sugerida: {suggestion['split_note']}\n"
-                            f"Este evento corresponde al bloque {session['session_index']}/"
-                            f"{session['session_total']} de {session['slot_duration_minutes']} min."
-                        )
-                    else:
-                        title = f"[Asistente] {suggestion['task_title']}"
-                        division_note = ""
-                        if suggestion.get("split_note"):
-                            division_note = f"Plan parcial: {suggestion['split_note']}"
-
-                    description = (
-                        f"Categoria: {suggestion['category']}\n"
-                        f"Prioridad: {suggestion['priority']}\n"
-                        f"Contexto: {suggestion.get('context') or '-'}{block_info}\n"
-                        f"Motivo: {suggestion['reason']}"
-                    )
-                    if suggestion.get("estimated_total_minutes"):
-                        description = (
-                            f"{description}\n"
-                            f"Estimacion total original: {suggestion['estimated_total_minutes']} min"
-                        )
-                    if suggestion.get("progress_percent") is not None:
-                        description = (
-                            f"{description}\n"
-                            f"Progreso actual en Notion: {round(suggestion['progress_percent'])}%"
-                        )
-                    if suggestion.get("remaining_minutes") is not None:
-                        description = (
-                            f"{description}\n"
-                            f"Minutos pendientes despues de lo programado hoy: {suggestion['remaining_minutes']}"
-                        )
-                    if division_note:
-                        description = f"{description}\n{division_note}"
-
-                    created_event = calendar.create_event(
-                        title,
-                        session["slot_start"],
-                        session["slot_end"],
-                        description,
-                        color_id=color_id,
-                    )
-                    if created_event is not None:
-                        created_events.append(created_event)
-            for suggestion in []:
-                title = f"[Asistente] {suggestion['task_title']}"
-                description = (
-                    f"Categoría: {suggestion['category']}\n"
-                    f"Prioridad: {suggestion['priority']}\n"
-                    f"Contexto: {suggestion.get('context') or '—'}\n"
-                    f"Motivo: {suggestion['reason']}"
-                )
-                color_id = CATEGORY_COLOR_MAP.get(suggestion["category"])
-                created_event = calendar.create_event(
-                    title,
-                    suggestion["slot_start"],
-                    suggestion["slot_end"],
-                    description,
-                    color_id=color_id,
-                )
-                if created_event is not None:
-                    created_events.append(created_event)
-            logger.info(
-                "%s/%s eventos creados en Google Calendar",
-                len(created_events),
-                planned_events,
-            )
-            self.diagnostics = DiagnosticReporter.build(
-                calendar.get_calendar_snapshot(),
-                self.events,
-                tasks_diagnostics,
-                unscheduled_tasks,
-                self.config.TIMEZONE,
-            )
-            if self.config.DIAGNOSTIC_MODE:
-                DiagnosticReporter.log(self.diagnostics)
-
-            now = datetime.now(timezone.utc)
-
-            logger.info("Construir email HTML...")
-            html_content = EmailConstructor.build_html(
-                self.tasks,
-                self.events,
-                self.free_slots,
-                self.suggestions,
-                now,
-                self.config.TIMEZONE,
-                self.config.TASK_HUB_URL,
-            )
-
-            logger.info("Enviar email...")
-            email_ok = EmailSender.send(
-                smtp_server=self.config.SMTP_SERVER,
-                smtp_port=self.config.SMTP_PORT,
-                email_from=self.config.EMAIL_FROM,
-                password=self.config.EMAIL_PASSWORD,
-                email_to=self.config.EMAIL_TO,
-                subject=f"Asistente - Plan del dia {now.astimezone(get_timezone(self.config.TIMEZONE)).strftime('%d/%m/%Y')}",
-                html_content=html_content,
-            )
-            if not email_ok:
-                return 1
-
-            logger.info("Actualizar pagina de Notion...")
-            notion_ok = notion.append_report_to_page(
-                self.config.NOTION_OUTPUT_PAGE_ID,
-                self.suggestions,
-                self.free_slots,
-                self.tasks,
-                now.astimezone(get_timezone(self.config.TIMEZONE)),
-                self.diagnostics if self.config.DIAGNOSTIC_MODE else None,
-                created_events,
-            )
-            if not notion_ok:
-                return 1
-
-            print("\n" + "=" * 70)
-            print("✅ ASISTENTE EJECUTADO EXITOSAMENTE")
-            print("=" * 70 + "\n")
-            return 0
-        except Exception as exc:
-            logger.error("ERROR: %s", exc)
-            print("\n" + "=" * 70)
-            print("❌ ERROR EN LA EJECUCION")
-            print("=" * 70 + "\n")
+        if not Config.validate():
             return 1
+
+        # 1. Leer calendario
+        logger.info("Leyendo Google Calendar...")
+        cal    = CalendarClient()
+        events = cal.get_events(Config.calendar_ids(), hours=48)
+
+        # 2. Leer tareas pendientes (Pilar 5: todas, no solo In progress)
+        logger.info("Leyendo tareas de Notion...")
+        notion = NotionClient()
+        tasks  = notion.get_pending_tasks(Config.NOTION_DATABASE_ID)
+
+        # 3. Huecos libres hoy
+        logger.info("Calculando huecos libres...")
+        free_slots = find_free_slots(events, Config.TIMEZONE)
+        logger.info("%d huecos disponibles:", len(free_slots))
+        for sl in free_slots:
+            logger.info("  %s (%d min) [%s]", sl["label"], sl["duration_min"], sl["context"])
+
+        # 4. Asignar sesiones (Pilares 2, 3, 5)
+        logger.info("Asignando sesiones...")
+        scheduler  = Scheduler()
+        scheduled, unscheduled = scheduler.assign(tasks, free_slots)
+        logger.info("%d sesiones asignadas / %d tareas sin hueco", len(scheduled), len(unscheduled))
+
+        # 5. Crear eventos en Google Calendar (Pilar 4)
+        logger.info("Creando eventos en Google Calendar...")
+        agendadas: Dict[str, int] = {}  # task_id → ultimo bloque_num agendado
+        for sess in scheduled:
+            bl = f" ({sess['bloque_numero']}/{sess['total_bloques']})" if sess["total_bloques"] else ""
+            title = f"[Asistente] {sess['task_title']}{bl}"
+            desc  = (
+                f"Categoria: {sess['category']}\n"
+                f"Prioridad: {sess['priority']}\n"
+                f"Contexto: {sess.get('contexto') or '-'}\n"
+                f"Score Urgencia: {sess['score']:.0f}\n"
+                f"Duracion sesion: {sess['duration_min']} min"
+            )
+            color = CATEGORY_COLOR_MAP.get(sess["category"])
+            ok = cal.create_event(title, sess["start"].isoformat(),
+                                  sess["end"].isoformat(), desc, color_id=color)
+            if ok:
+                # Registrar el bloque más alto agendado para esta tarea
+                prev = agendadas.get(sess["task_id"], 0)
+                agendadas[sess["task_id"]] = max(prev, sess["bloques_completados_finales"])
+
+        logger.info("%d eventos creados", len(agendadas))
+
+        # 6. Sincronizar Status en Notion (Pilar 6)
+        logger.info("Actualizando Notion...")
+        for task_id, bloque_final in agendadas.items():
+            notion.mark_in_progress(task_id)
+            notion.update_bloques(task_id, bloque_final)
+
+        # 7. Email (sin página de Notion — Pilar 4)
+        logger.info("Enviando email...")
+        now  = datetime.now(timezone.utc)
+        html = EmailBuilder.build(
+            scheduled, unscheduled, free_slots, events,
+            now, Config.TIMEZONE, Config.TASK_HUB_URL,
+        )
+        subject = (
+            f"Asistente · {now.astimezone(get_tz(Config.TIMEZONE)).strftime('%d/%m/%Y')} · "
+            f"{len(agendadas)} tareas agendadas"
+        )
+        if not EmailSender.send(subject, html):
+            return 1
+
+        print("\n" + "=" * 70)
+        print("ASISTENTE EJECUTADO EXITOSAMENTE")
+        print(f"  Tareas agendadas:   {len(agendadas)}")
+        print(f"  Sin hueco hoy:      {len(unscheduled)}")
+        print(f"  Eventos calendario: {len(events)}")
+        print("=" * 70 + "\n")
+        return 0
 
 
 if __name__ == "__main__":
-    config = ConfigAsistente()
-    asistente = Asistente(config)
-    sys.exit(asistente.run())
+    sys.exit(Asistente().run())
