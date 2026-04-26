@@ -720,7 +720,7 @@ class NotionIntegration:
         # "Minutos Restantes" devuelve 0 o porque completed_flag se activó   #
         # erroneamente durante la extraccion.                                 #
         # ------------------------------------------------------------------ #
-        if status == "en progreso":
+        if status in {"en progreso", "in progress"}:
             return True, "incluida: en progreso"
 
         # Para tareas que NO estan en progreso aplicamos checks normales.
@@ -754,7 +754,7 @@ class NotionIntegration:
             return True, "incluida: vence hoy"
         if due <= today + timedelta(days=3):
             return True, f"incluida: proxima ventana ({due.isoformat()})"
-        if priority in {"alta", "urgente", "high", "critical"}:
+        if priority in {"alta", "urgente", "high", "critical", "media"}:
             return True, f"incluida: prioridad alta aunque vence despues ({due.isoformat()})"
         return False, f"descartada: vence mas adelante ({due.isoformat()})"
 
@@ -985,7 +985,7 @@ class NotionIntegration:
         # marcada como completada por un campo en 0 o formula sin calcular.   #
         # ------------------------------------------------------------------ #
         status_normalized = self._normalize_label(status_value)
-        if status_normalized != "en progreso":
+        if status_normalized not in {"en progreso", "in progress"}:
             if remaining_minutes is not None and remaining_minutes <= 0:
                 completed_flag = True
             if progress_percent is not None and progress_percent >= 100:
@@ -1329,14 +1329,14 @@ class ExplicadorDeSugerencias:
         priority = task.get("priority", "Normal")
         due_date = task.get("due_date")
         status = (task.get("status", "") or "").lower()
-        if status == "en progreso" and task.get("remaining_minutes") is not None:
+        if status in {"en progreso", "in progress"} and task.get("remaining_minutes") is not None:
             estimated = task.get("remaining_minutes")
         else:
             estimated = task.get("estimated_minutes")
 
         reasons = []
 
-        if priority in {"Urgente", "Alta"}:
+        if priority in {"Urgente", "Alta", "Media"}:
             reasons.append(f"prioridad {priority.lower()}")
 
         if due_date:
@@ -1359,8 +1359,8 @@ class ExplicadorDeSugerencias:
 class MotorDeSugerencias:
     """Detecta huecos y propone tareas dentro de ellos."""
 
-    PRIORITY_SCORES = {"Urgente": 4, "Alta": 3, "Normal": 2, "Baja": 1}
-    DEFAULT_TASK_MINUTES = {"Urgente": 90, "Alta": 60, "Normal": 45, "Baja": 30}
+    PRIORITY_SCORES = {"Urgente": 4, "Alta": 3, "Media": 2, "Normal": 2, "Baja": 1}
+    DEFAULT_TASK_MINUTES = {"Urgente": 90, "Alta": 60, "Media": 45, "Normal": 45, "Baja": 30}
     MAX_FOCUS_BLOCK_MINUTES = 120
     MAX_BREAK_BETWEEN_BLOCKS_MINUTES = 15
     WORKDAY_START_HOUR = 6
@@ -1476,7 +1476,7 @@ class MotorDeSugerencias:
         remaining = task.get("remaining_minutes")
         estimated = task.get("estimated_minutes")
 
-        if status == "en progreso":
+        if status in {"en progreso", "in progress"}:
             # FIX #4: si remaining existe y es > 0 usalo.
             # Si es 0 o None (campo vacio o formula sin calcular),
             # cae a estimated como respaldo antes de devolver None.
@@ -1906,7 +1906,7 @@ class EmailConstructor:
         tz_name: str,
         task_hub_url: str,
     ) -> str:
-        critical_tasks = [task for task in tasks if task.get("priority") in ["Alta", "Urgente"]]
+        critical_tasks = [task for task in tasks if task.get("priority") in ["Alta", "Urgente", "Media"]]
         local_tz = get_timezone(tz_name)
         date_str = timestamp.astimezone(local_tz).strftime("%d/%m/%Y %H:%M")
         today_events, tomorrow_events = split_events_by_day(events, local_tz)
@@ -1923,6 +1923,7 @@ class EmailConstructor:
             priority_color = {
                 "Urgente": "#ef4444",
                 "Alta": "#f97316",
+                "Media": "#f59e0b",
                 "Normal": "#2563eb",
                 "Baja": "#64748b",
             }.get(priority, "#2563eb")
@@ -1984,6 +1985,7 @@ class EmailConstructor:
             priority_color = {
                 "Urgente": "#ef4444",
                 "Alta": "#f97316",
+                "Media": "#f59e0b",
                 "Normal": "#2563eb",
                 "Baja": "#64748b",
             }.get(priority, "#2563eb")
