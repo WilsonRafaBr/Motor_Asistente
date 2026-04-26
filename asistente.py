@@ -784,9 +784,28 @@ class NotionIntegration:
 
         return all_results
 
+    _diag_count = 0  # contador de clase para limitar logs crudos
+
     def _extract_task_from_result(self, result: Dict, properties: Dict) -> Dict:
         """Extrae una tarea adaptandose al esquema real del data source."""
         props = result.get("properties", {})
+
+        # LOG DIAGNOSTICO: imprime propiedades crudas de las primeras 3 tareas
+        NotionIntegration._diag_count += 1
+        if NotionIntegration._diag_count <= 3:
+            import json as _json
+            logger.info(
+                "RAW_PROPS[%s]: %s",
+                NotionIntegration._diag_count,
+                _json.dumps(
+                    {k: v for k, v in props.items()
+                     if k in ("Status", "Priority", "⏳ Minutos Restantes",
+                               "⏱️ Duración (min)", "🧩 Bloques Completados",
+                               "🔢 Total Bloques", "✅ Sincronizada", "Name")},
+                    ensure_ascii=False,
+                    default=str,
+                )[:800]
+            )
 
         title_name, _ = self._find_property(properties, ["title"], ["Name", "Nombre", "Tarea", "Task"])
         due_name, _ = self._find_property(
