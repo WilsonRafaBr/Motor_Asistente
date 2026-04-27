@@ -374,6 +374,18 @@ def _infer_ctx(s,e,campus)->str:
     return "flexible"
 
 def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
+    """
+    Genera tres tipos de slots:
+      - "Casa"      : tiempo libre antes de la primera clase o después de la última.
+      - "Facultad"  : tiempo libre entre clases (gap <= 240 min).
+      - "Transporte": la hora antes de la primera clase y la hora después de la última.
+                      No se bloquean como tiempo perdido; son slots especiales que
+                      solo aceptan tareas con contexto Transporte.
+      - "flexible"  : días sin clases.
+
+    La 1h de buffer de transporte NO va a `occupied` — va a `transporte_slots`.
+    Así no desaparece del mapa; está disponible solo para tareas de Transporte.
+    """
     tz=get_tz(tz_name); now=datetime.now(tz); today=now.date()
     day_s=now.replace(hour=Config.WORKDAY_START,minute=0,second=0,microsecond=0)
     day_e=now.replace(hour=Config.WORKDAY_END,  minute=0,second=0,microsecond=0)
@@ -388,51 +400,114 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
     today_ev.sort(key=lambda x:x["start_local"])
     campus=[e for e in today_ev if _is_campus(e)]
 
+    # ── Occupied: eventos reales + almuerzo (NO los buffers de transporte) ───
     occupied=[{"start":e["start_local"],"end":e["end_local"]} for e in today_ev]
     lunch_s=now.replace(hour=Config.LUNCH_START,minute=0,second=0,microsecond=0)
     lunch_e=now.replace(hour=Config.LUNCH_END,  minute=0,second=0,microsecond=0)
     occupied.append({"start":lunch_s,"end":lunch_e})
 
+    # ── Slots de Transporte: 1h pre-primera clase y 1h post-última clase ─────
+    transporte_slots:List[Dict]=[]
     if campus:
         first,last=campus[0],campus[-1]
-        # Buffer 1h antes de primera clase y 1h después de última
-        occupied.append({"start":max(day_s,first["start_local"]-timedelta(hours=1)),
-                         "end":first["start_local"]})
-        occupied.append({"start":last["end_local"],
-                         "end":min(day_e,last["end_local"]+timedelta(hours=1))})
 
+        # Ventana pre-clase (transporte de ida)
+        t_pre_s=max(day_s, first["start_local"]-timedelta(hours=1))
+        t_pre_e=first["start_local"]
+        dur_pre=int((t_pre_e-t_pre_s).total_seconds()/60)
+        if dur_pre>0:
+            transporte_slots.append({
+                "start":t_pre_s,"end":t_pre_e,"duration_min":dur_pre,
+                "label":f"{t_pre_s.strftime('%H:%M')} - {t_pre_e.strftime('%H:%M')} [Transporte]",
+                "context":"Transporte",
+            })
+            # Sí va a occupied: ninguna tarea no-transporte puede entrar aquí
+            occupied.append({"start":t_pre_s,"end":t_pre_e})
+
+        # Ventana post-clase (transporte de vuelta)
+        t_post_s=last["end_local"]
+        t_post_e=min(day_e, last["end_local"]+timedelta(hours=1))
+        dur_post=int((t_post_e-t_post_s).total_seconds()/60)
+        if dur_post>0:
+            transporte_slots.append({
+                "start":t_post_s,"end":t_post_e,"duration_min":dur_post,
+                "label":f"{t_post_s.strftime('%H:%M')} - {t_post_e.strftime('%H:%M')} [Transporte]",
+                "context":"Transporte",
+            })
+            occupied.append({"start":t_post_s,"end":t_post_e})
+
+    # ── Slots regulares (Casa / Facultad / flexible) ──────────────────────────
     merged=_merge([iv for iv in occupied if iv["end"]>day_s and iv["start"]<day_e])
-    slots=[]; cursor=day_s
+    regular_slots:List[Dict]=[]; cursor=day_s
     for iv in merged:
         if iv["start"]>cursor:
             dur=int((iv["start"]-cursor).total_seconds()/60)
             if dur>=Config.MIN_SESSION:
-                slots.append({"start":cursor,"end":iv["start"],"duration_min":dur,
-                              "label":f"{cursor.strftime('%H:%M')} - {iv['start'].strftime('%H:%M')}",
-                              "context":_infer_ctx(cursor,iv["start"],campus)})
+                ctx=_infer_ctx(cursor,iv["start"],campus)
+                regular_slots.append({
+                    "start":cursor,"end":iv["start"],"duration_min":dur,
+                    "label":f"{cursor.strftime('%H:%M')} - {iv['start'].strftime('%H:%M')}",
+                    "context":ctx,
+                })
         cursor=max(cursor,iv["end"])
     if cursor<day_e:
         dur=int((day_e-cursor).total_seconds()/60)
         if dur>=Config.MIN_SESSION:
-            slots.append({"start":cursor,"end":day_e,"duration_min":dur,
-                         "label":f"{cursor.strftime('%H:%M')} - {day_e.strftime('%H:%M')}",
-                         "context":_infer_ctx(cursor,day_e,campus)})
-    return slots
+            ctx=_infer_ctx(cursor,day_e,campus)
+            regular_slots.append({
+                "start":cursor,"end":day_e,"duration_min":dur,
+                "label":f"{cursor.strftime('%H:%M')} - {day_e.strftime('%H:%M')}",
+                "context":ctx,
+            })
+
+    # ── Orden cronológico: primero regulares + transporte mezclados por hora ──
+    all_slots=sorted(regular_slots+transporte_slots, key=lambda x:x["start"])
+
+    logger.info("Slots generados:")
+    for sl in all_slots:
+        logger.info("  %s (%dmin) [%s]",sl["label"],sl["duration_min"],sl["context"])
+    return all_slots
+
 
 def _ctx_ok(task_contextos:List[str], slot_ctx:str) -> bool:
     """
-    Multi-select: si la tarea no tiene contexto → acepta cualquier slot.
-    Si tiene contextos → el slot debe coincidir con al menos uno.
+    Reglas de compatibilidad contexto tarea ↔ contexto slot:
+
+    Slot Transporte → SOLO acepta tareas que incluyan "Transporte".
+    Slot Casa       → acepta tareas con "Casa" o sin contexto (flexible).
+    Slot Facultad   → acepta tareas con "Facultad" o sin contexto (flexible).
+    Slot flexible   → acepta cualquier tarea sin restricción de contexto.
+
+    Tarea sin contexto → acepta cualquier slot EXCEPTO Transporte.
     """
-    if not task_contextos:
-        return True
     slot_norm=slot_ctx.lower()
-    for tc in task_contextos:
-        tc_l=tc.lower()
-        if "casa" in tc_l and slot_norm in ("casa","flexible"):   return True
-        if "facultad" in tc_l and slot_norm in ("facultad","flexible"): return True
-        if "transporte" in tc_l:                                        return True
-    return False
+    task_norms=[tc.lower() for tc in task_contextos]
+    tiene_transporte=any("transporte" in tc for tc in task_norms)
+    tiene_casa      =any("casa" in tc for tc in task_norms)
+    tiene_facultad  =any("facultad" in tc for tc in task_norms)
+    sin_contexto    =not task_contextos
+
+    if slot_norm=="transporte":
+        # Solo tareas explícitamente marcadas para transporte
+        return tiene_transporte
+
+    if slot_norm in ("casa","flexible") and not slot_norm=="transporte":
+        if sin_contexto:         return True
+        if tiene_casa:           return True
+        if tiene_facultad and slot_norm=="flexible": return True
+        return False
+
+    if slot_norm=="facultad":
+        if sin_contexto:    return True
+        if tiene_facultad:  return True
+        return False
+
+    # slot flexible: todo excepto tareas que SOLO quieran transporte
+    if slot_norm=="flexible":
+        if sin_contexto: return True
+        return tiene_casa or tiene_facultad or tiene_transporte
+
+    return True
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 class Scheduler:
