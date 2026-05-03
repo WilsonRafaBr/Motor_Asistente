@@ -19,7 +19,7 @@ def info(msg): print(f"  ℹ️  {msg}")
 sep("1. VARIABLES DE ENTORNO")
 vars_check = {
     "GOOGLE_CREDENTIALS_JSON": os.environ.get("GOOGLE_CREDENTIALS_JSON",""),
-    "GOOGLE_CALENDAR_IDS":     os.environ.get("GOOGLE_CALENDAR_IDS",""),
+    "GOOGLE_CALENDAR_ID":      os.environ.get("GOOGLE_CALENDAR_ID",""),
     "NOTION_API_KEY":          os.environ.get("NOTION_API_KEY",""),
     "NOTION_DATABASE_ID":      os.environ.get("NOTION_DATABASE_ID",""),
     "EMAIL_FROM":              os.environ.get("EMAIL_FROM",""),
@@ -85,9 +85,9 @@ if svc:
     except Exception as e:
         err(f"Error listando calendarios: {e}")
 
-# ─── 5. Verificar GOOGLE_CALENDAR_IDS ────────────────────────────────────────
-sep("5. CONFIGURACIÓN GOOGLE_CALENDAR_IDS")
-cal_ids_raw = os.environ.get("GOOGLE_CALENDAR_IDS","")
+# ─── 5. Verificar GOOGLE_CALENDAR_ID ─────────────────────────────────────────
+sep("5. CONFIGURACIÓN GOOGLE_CALENDAR_ID")
+cal_ids_raw = os.environ.get("GOOGLE_CALENDAR_ID","") or os.environ.get("GOOGLE_CALENDAR_IDS","")
 if cal_ids_raw:
     cal_ids = [x.strip() for x in cal_ids_raw.split(",") if x.strip()]
     info(f"IDs configurados: {cal_ids}")
@@ -100,7 +100,7 @@ if cal_ids_raw:
             err(f"{cid} — NO VISIBLE para la service account")
             info("Solución: comparte ese calendario con la service account")
 else:
-    err("GOOGLE_CALENDAR_IDS vacío — el código usará ALL (todos los calendarios visibles)")
+    err("GOOGLE_CALENDAR_ID vacío — el código usará ALL (todos los calendarios visibles)")
     if not visible_calendars:
         err("Pero no hay calendarios visibles, así que leerá 0 eventos")
 
@@ -144,7 +144,7 @@ if svc and visible_calendars:
     start = now_local.replace(second=0, microsecond=0) + timedelta(minutes=5)
     end   = start + timedelta(minutes=30)
 
-    # Usar el primer calendario visible (o el configurado en GOOGLE_CALENDAR_IDS)
+    # Usar el primer calendario visible (o el configurado en GOOGLE_CALENDAR_ID)
     target_cal = cal_ids[0] if cal_ids_raw and cal_ids else visible_calendars[0]
     info(f"Intentando crear evento en: {target_cal}")
     info(f"Horario: {start.strftime('%H:%M')} - {end.strftime('%H:%M')}")
@@ -181,7 +181,7 @@ elif svc and not visible_calendars:
   2. Click en ⋮ junto a tu calendario → Configuración y uso compartido
   3. Compartir con personas: {sa_data.get('client_email') if sa_data else 'tu service account email'}
   4. Permiso: "Realizar cambios en eventos"
-  5. Agrega el secret GOOGLE_CALENDAR_IDS = quizhpybravowilsonrafael@gmail.com
+  5. Agrega el secret GOOGLE_CALENDAR_ID = quizhpybravowilsonrafael@gmail.com
 """)
 elif not svc:
     err("PROBLEMA PRINCIPAL: No se pudo autenticar con Google")

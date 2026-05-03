@@ -47,6 +47,7 @@ CAT_COLOR = {"🧠 Estudio":"9","💪 Gym":"2","🇩🇪 Alemania":"5",
 # ── Configuración ─────────────────────────────────────────────────────────────
 class Config:
     GOOGLE_CREDENTIALS_JSON    = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    GOOGLE_CALENDAR_ID         = os.environ.get("GOOGLE_CALENDAR_ID")
     GOOGLE_CALENDAR_IDS        = os.environ.get("GOOGLE_CALENDAR_IDS")
     GOOGLE_OAUTH_CLIENT_ID     = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
     GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
@@ -73,7 +74,7 @@ class Config:
 
     @classmethod
     def calendar_ids(cls) -> List[str]:
-        raw = cls.GOOGLE_CALENDAR_IDS
+        raw = cls.GOOGLE_CALENDAR_ID or cls.GOOGLE_CALENDAR_IDS
         if raw:
             ids = [x.strip() for x in raw.split(",") if x.strip()]
             if ids: return ids
@@ -174,16 +175,12 @@ class CalendarClient:
         return {c["id"]:c for c in items}
 
     def get_write_calendar_id(self) -> str:
-        avail = self.list_calendars()
         selected = Config.calendar_ids()
 
         if selected != ["ALL"]:
-            for cid in selected:
-                if cid in avail:
-                    return cid
-            raise RuntimeError(
-                "Ninguno de los GOOGLE_CALENDAR_IDS configurados esta visible para escritura."
-            )
+            return selected[0]
+
+        avail = self.list_calendars()
 
         if avail:
             return next(iter(avail.keys()))

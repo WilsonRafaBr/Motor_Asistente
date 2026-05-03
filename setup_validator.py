@@ -305,7 +305,7 @@ def main():
 
     validations = [
         ("GOOGLE_CREDENTIALS_JSON", "Google Calendar Credentials", True),
-        ("GOOGLE_CALENDAR_IDS", "Google Calendar IDs", False),
+        ("GOOGLE_CALENDAR_ID", "Google Calendar ID", False),
         ("NOTION_API_KEY", "Notion API Key", False),
         ("NOTION_DATABASE_ID", "Notion Database ID", False),
         ("NOTION_OUTPUT_PAGE_ID", "Notion Output Page ID", False),
