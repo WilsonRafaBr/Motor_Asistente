@@ -126,23 +126,43 @@ class CalendarClient:
 
     def __init__(self):
         cfg = Config
-        try:
-            if all([cfg.GOOGLE_OAUTH_CLIENT_ID, cfg.GOOGLE_OAUTH_CLIENT_SECRET,
-                    cfg.GOOGLE_OAUTH_REFRESH_TOKEN, cfg.GOOGLE_OAUTH_TOKEN_URI]):
+        creds = None
+        mode  = None
+
+        # ── 1. Service Account (sin expiración, más estable) ─────────────────
+        if cfg.GOOGLE_CREDENTIALS_JSON:
+            try:
+                creds = Credentials.from_service_account_info(
+                    json.loads(cfg.GOOGLE_CREDENTIALS_JSON), scopes=self.SCOPES)
+                mode = "service_account"
+                logger.info("Google Calendar: usando service account")
+            except Exception as e:
+                logger.warning("Service account falló, intentando OAuth: %s", e)
+                creds = None
+
+        # ── 2. OAuth refresh token (fallback; expira cada 7 días en modo Testing) ──
+        if creds is None and all([cfg.GOOGLE_OAUTH_CLIENT_ID, cfg.GOOGLE_OAUTH_CLIENT_SECRET,
+                                   cfg.GOOGLE_OAUTH_REFRESH_TOKEN, cfg.GOOGLE_OAUTH_TOKEN_URI]):
+            try:
                 creds = UserCredentials(
                     token=None, refresh_token=cfg.GOOGLE_OAUTH_REFRESH_TOKEN,
                     token_uri=cfg.GOOGLE_OAUTH_TOKEN_URI, client_id=cfg.GOOGLE_OAUTH_CLIENT_ID,
                     client_secret=cfg.GOOGLE_OAUTH_CLIENT_SECRET, scopes=self.SCOPES)
                 creds.refresh(GoogleAuthRequest())
                 mode = "oauth_user"
-            else:
-                creds = Credentials.from_service_account_info(
-                    json.loads(cfg.GOOGLE_CREDENTIALS_JSON), scopes=self.SCOPES)
-                mode = "service_account"
-            self._svc = build("calendar","v3",credentials=creds)
-            logger.info("Google Calendar autenticado (%s)", mode)
-        except Exception as e:
-            logger.error("Error autenticando Google Calendar: %s", e); raise
+                logger.info("Google Calendar: usando OAuth")
+            except Exception as e:
+                logger.error("OAuth también falló: %s", e)
+                creds = None
+
+        if creds is None:
+            raise RuntimeError(
+                "No se pudo autenticar Google Calendar. "
+                "Verifica GOOGLE_CREDENTIALS_JSON (service account) o regenera GOOGLE_OAUTH_REFRESH_TOKEN."
+            )
+
+        self._svc = build("calendar","v3",credentials=creds)
+        logger.info("Google Calendar autenticado (%s)", mode)
 
     def list_calendars(self) -> Dict[str,Dict]:
         items, token = [], None
@@ -383,8 +403,10 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
                       solo aceptan tareas con contexto Transporte.
       - "flexible"  : días sin clases.
 
-    La 1h de buffer de transporte NO va a `occupied` — va a `transporte_slots`.
-    Así no desaparece del mapa; está disponible solo para tareas de Transporte.
+    Los slots de Transporte se agregan TANTO a `occupied` (para que ninguna tarea
+    regular pueda entrar) COMO a `transporte_slots` (para que tareas marcadas con
+    contexto Transporte sí puedan agendarse ahí). Es la única zona del día con esa
+    dualidad — el resto de occupied es tiempo completamente bloqueado.
     """
     tz=get_tz(tz_name); now=datetime.now(tz); today=now.date()
     day_s=now.replace(hour=Config.WORKDAY_START,minute=0,second=0,microsecond=0)
@@ -471,43 +493,39 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
 
 def _ctx_ok(task_contextos:List[str], slot_ctx:str) -> bool:
     """
-    Reglas de compatibilidad contexto tarea ↔ contexto slot:
+    Compatibilidad contexto tarea ↔ contexto slot.
 
-    Slot Transporte → SOLO acepta tareas que incluyan "Transporte".
-    Slot Casa       → acepta tareas con "Casa" o sin contexto (flexible).
-    Slot Facultad   → acepta tareas con "Facultad" o sin contexto (flexible).
-    Slot flexible   → acepta cualquier tarea sin restricción de contexto.
-
-    Tarea sin contexto → acepta cualquier slot EXCEPTO Transporte.
+    Slot "Transporte" → SOLO tareas que incluyan "Transporte".
+    Slot "Casa"       → tareas con "Casa", sin contexto, o "Facultad" en flexible.
+    Slot "Facultad"   → tareas con "Facultad" o sin contexto.
+    Slot "flexible"   → cualquier tarea EXCEPTO las que solo tienen "Transporte".
+    Tarea sin contexto → cualquier slot EXCEPTO "Transporte".
     """
-    slot_norm=slot_ctx.lower()
-    task_norms=[tc.lower() for tc in task_contextos]
-    tiene_transporte=any("transporte" in tc for tc in task_norms)
-    tiene_casa      =any("casa" in tc for tc in task_norms)
-    tiene_facultad  =any("facultad" in tc for tc in task_norms)
-    sin_contexto    =not task_contextos
+    slot_norm = slot_ctx.lower()
+    task_norms = [tc.lower() for tc in task_contextos]
+    tiene_transporte = any("transporte" in tc for tc in task_norms)
+    tiene_casa       = any("casa"       in tc for tc in task_norms)
+    tiene_facultad   = any("facultad"   in tc for tc in task_norms)
+    sin_contexto     = not task_contextos
 
-    if slot_norm=="transporte":
-        # Solo tareas explícitamente marcadas para transporte
-        return tiene_transporte
+    if slot_norm == "transporte":
+        return tiene_transporte  # SOLO tareas de transporte
 
-    if slot_norm in ("casa","flexible") and not slot_norm=="transporte":
-        if sin_contexto:         return True
-        if tiene_casa:           return True
-        if tiene_facultad and slot_norm=="flexible": return True
-        return False
+    # A partir de aquí: slots que NO son Transporte → tareas de transporte nunca entran
+    # a menos que también tengan otro contexto compatible.
+    if sin_contexto:
+        return True  # tarea sin contexto acepta Casa, Facultad y flexible
 
-    if slot_norm=="facultad":
-        if sin_contexto:    return True
-        if tiene_facultad:  return True
-        return False
+    if slot_norm == "casa":
+        return tiene_casa  # solo tareas con Casa (o flexible via sin_contexto, ya cubierto)
 
-    # slot flexible: todo excepto tareas que SOLO quieran transporte
-    if slot_norm=="flexible":
-        if sin_contexto: return True
-        return tiene_casa or tiene_facultad or tiene_transporte
+    if slot_norm == "facultad":
+        return tiene_facultad  # solo tareas con Facultad (o sin contexto, ya cubierto)
 
-    return True
+    if slot_norm == "flexible":
+        return tiene_casa or tiene_facultad  # transporte-only quedaría fuera
+
+    return True  # fallback para contextos desconocidos
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 class Scheduler:
