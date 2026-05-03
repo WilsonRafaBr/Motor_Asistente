@@ -173,6 +173,23 @@ class CalendarClient:
             if not token: break
         return {c["id"]:c for c in items}
 
+    def get_write_calendar_id(self) -> str:
+        avail = self.list_calendars()
+        selected = Config.calendar_ids()
+
+        if selected != ["ALL"]:
+            for cid in selected:
+                if cid in avail:
+                    return cid
+            raise RuntimeError(
+                "Ninguno de los GOOGLE_CALENDAR_IDS configurados esta visible para escritura."
+            )
+
+        if avail:
+            return next(iter(avail.keys()))
+
+        raise RuntimeError("La cuenta de Google no tiene calendarios visibles para escritura.")
+
     def get_events(self, cal_ids: List[str], hours:int=48) -> List[Dict]:
         now = datetime.now(timezone.utc)
         horizon = now + timedelta(hours=hours)
@@ -218,9 +235,10 @@ class CalendarClient:
         return sorted(seen.values(),key=lambda x:x["start"])
 
     def create_event(self, title:str, start_iso:str, end_iso:str,
-                     desc:str="", color_id:Optional[str]=None, cal_id:str="primary") -> Optional[Dict]:
+                     desc:str="", color_id:Optional[str]=None, cal_id:Optional[str]=None) -> Optional[Dict]:
         tz_name=Config.TIMEZONE
         ltz=get_tz(tz_name)
+        target_cal_id = cal_id or self.get_write_calendar_id()
         def loc(v:str)->str:
             dt=datetime.fromisoformat(v.replace("Z","+00:00"))
             dt=dt.replace(tzinfo=ltz) if dt.tzinfo is None else dt.astimezone(ltz)
@@ -230,10 +248,10 @@ class CalendarClient:
               "end":{"dateTime":loc(end_iso),"timeZone":tz_name}}
         if color_id: body["colorId"]=color_id
         try:
-            c=self._svc.events().insert(calendarId=cal_id,body=body).execute()
-            logger.info("Evento creado: %s",c.get("id")); return c
+            c=self._svc.events().insert(calendarId=target_cal_id,body=body).execute()
+            logger.info("Evento creado: %s en calendario %s",c.get("id"),target_cal_id); return c
         except Exception as e:
-            logger.error("Error creando evento: %s",e); return None
+            logger.error("Error creando evento en calendario %s: %s",target_cal_id,e); return None
 
 # ── Notion Client ─────────────────────────────────────────────────────────────
 class NotionClient:
