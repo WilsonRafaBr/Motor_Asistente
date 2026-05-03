@@ -26,6 +26,35 @@ jobs:
     - name: Instalar dependencias
       run: |
         pip install -r requirements.txt
+
+    - name: Validar secrets de Google Calendar
+      env:
+        GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+      run: |
+        python - <<'PY'
+        import json, os, sys
+        calendar_id = (os.environ.get("GOOGLE_CALENDAR_ID") or "").strip()
+        creds_raw = (os.environ.get("GOOGLE_CREDENTIALS_JSON") or "").strip()
+        if not calendar_id:
+            print("ERROR: GOOGLE_CALENDAR_ID no esta definido en GitHub Secrets.")
+            sys.exit(1)
+        if not creds_raw:
+            print("ERROR: GOOGLE_CREDENTIALS_JSON no esta definido en GitHub Secrets.")
+            sys.exit(1)
+        try:
+            creds = json.loads(creds_raw)
+        except Exception as exc:
+            print(f"ERROR: GOOGLE_CREDENTIALS_JSON no es JSON valido: {exc}")
+            sys.exit(1)
+        client_email = creds.get("client_email")
+        if not client_email:
+            print("ERROR: GOOGLE_CREDENTIALS_JSON no contiene client_email.")
+            sys.exit(1)
+        print("OK: Secrets de Google Calendar presentes.")
+        print(f"OK: GOOGLE_CALENDAR_ID configurado (longitud={len(calendar_id)}).")
+        print(f"OK: Service account detectada: {client_email}.")
+        PY
     
     - name: Ejecutar Asistente
       env:
@@ -34,6 +63,7 @@ jobs:
         NOTION_OUTPUT_PAGE_ID: ${{ secrets.NOTION_OUTPUT_PAGE_ID }}
         GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+        GOOGLE_CALENDAR_IDS: ${{ secrets.GOOGLE_CALENDAR_ID }}
         SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
         EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
