@@ -2,6 +2,7 @@
 """
 ASISTENTE - Motor de Productividad
 Pilares: Score Urgencia · Buffer 15min · Límite 6h · Multi-select contexto · UUID fix
++ Módulo de Repaso Espaciado (BD Maestra de Estudio → Task Hub → Email)
 """
 
 import json, logging, os, smtplib, sys
@@ -64,13 +65,16 @@ class Config:
     EMAIL_TO     = os.environ.get("EMAIL_TO", os.environ.get("EMAIL_FROM"))
     TIMEZONE     = os.environ.get("TIMEZONE","America/Guayaquil")
 
+    # BD Maestra de Estudio (Repaso Espaciado)
+    REPASO_DB_ID = os.environ.get("REPASO_DB_ID", "b169fe4e77ed4c4ba2e452979efbbd1b")
+
     WORKDAY_START  = 6
     WORKDAY_END    = 22
     LUNCH_START    = 13
     LUNCH_END      = 14
-    MIN_SESSION    = 45    # mínimo para agendar una sesión (min)
-    BUFFER_MINUTES = 15    # pausa obligatoria entre bloques
-    MAX_STUDY_HOURS = 6    # límite diario de estudio neto
+    MIN_SESSION    = 45
+    BUFFER_MINUTES = 15
+    MAX_STUDY_HOURS = 6
 
     @classmethod
     def calendar_ids(cls) -> List[str]:
@@ -94,25 +98,16 @@ class Config:
 
 # ── UUID helpers ──────────────────────────────────────────────────────────────
 def _to_uuid(raw: Optional[str]) -> Optional[str]:
-    """
-    Convierte un ID de Notion (con o sin guiones, con prefijos de URL)
-    al formato UUID canónico con guiones: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    Esto es lo que exige la API de pages/PATCH.
-    """
     if not raw:
         return raw
     s = raw.strip()
-    # Limpiar parámetros y fragmentos de URL
     for sep in ("?","#"): s = s.split(sep)[0]
-    # Extraer último segmento si hay slash
     if "/" in s: s = s.rstrip("/").split("/")[-1]
-    # Quitar guiones existentes para normalizar
     s = s.replace("-","")
-    # Tomar solo los últimos 32 hex chars (el ID real puede estar al final)
     hex_chars = "".join(c for c in s if c in "0123456789abcdefABCDEF")
     if len(hex_chars) < 32:
-        return raw  # no pudimos parsear, devolver original
-    h = hex_chars[-32:]  # tomar los últimos 32 en caso de prefijo extra
+        return raw
+    h = hex_chars[-32:]
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 def _notion_error(r: requests.Response) -> str:
@@ -120,6 +115,241 @@ def _notion_error(r: requests.Response) -> str:
         d = r.json()
         return f"{d.get('code','')}: {d.get('message','')}" if d.get("code") else d.get("message", f"HTTP {r.status_code}")
     except: return f"HTTP {r.status_code}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MÓDULO DE REPASO ESPACIADO
+# Lee la BD Maestra de Estudio, crea tareas urgentes en el Task Hub,
+# y devuelve un bloque HTML para inyectar en el email diario.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Minutos estimados por nivel de dominio
+_DURACION_REPASO = {"1": 30, "2": 25, "3": 20, "4": 15, "5": 10}
+
+def _repaso_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {Config.NOTION_API_KEY}",
+        "Notion-Version": Config.NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+def _query_repaso_db(filtro: dict) -> List[dict]:
+    """Pagina completa sobre la BD Maestra con el filtro dado."""
+    db_id = _to_uuid(Config.REPASO_DB_ID)
+    results = []
+    cursor = None
+    while True:
+        body = {"page_size": 100, "filter": filtro}
+        if cursor:
+            body["start_cursor"] = cursor
+        r = requests.post(
+            f"https://api.notion.com/v1/databases/{db_id}/query",
+            headers=_repaso_headers(), json=body, timeout=20,
+        )
+        if r.status_code >= 400:
+            logger.error("Error consultando BD Repaso: %s", _notion_error(r))
+            break
+        data = r.json()
+        results.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return results
+
+def _parse_repaso_page(page: dict) -> dict:
+    props = page.get("properties", {})
+
+    def sel(name):
+        s = props.get(name, {}).get("select")
+        return s["name"] if s else None
+
+    def titulo():
+        t = props.get("Tema", {}).get("title", [])
+        return t[0]["plain_text"] if t else "Sin título"
+
+    def formula_date():
+        f = props.get("Próximo Repaso", {}).get("formula", {})
+        d = f.get("date", {})
+        return d.get("start") if isinstance(d, dict) else None
+
+    return {
+        "id": page["id"],
+        "tema": titulo(),
+        "materia": sel("Materia"),
+        "semestre": sel("Semestre"),
+        "nivel": sel("Nivel de Dominio"),
+        "proximo_repaso": formula_date(),
+    }
+
+def _tarea_repaso_existe(hub_id: str, nombre: str, hoy_str: str) -> bool:
+    """Evita duplicados: busca tarea con mismo nombre y fecha de hoy."""
+    r = requests.post(
+        f"https://api.notion.com/v1/databases/{_to_uuid(hub_id)}/query",
+        headers=_repaso_headers(),
+        json={
+            "filter": {
+                "and": [
+                    {"property": "Name", "title": {"equals": nombre}},
+                    {"property": "Due date", "date": {"equals": hoy_str}},
+                ]
+            },
+            "page_size": 1,
+        },
+        timeout=20,
+    )
+    if r.status_code >= 400:
+        return False
+    return len(r.json().get("results", [])) > 0
+
+def _crear_tarea_repaso(hub_id: str, tema: dict, hoy_str: str, urgente: bool) -> bool:
+    nombre = f"📖 Repasar: {tema['tema']}"
+    if _tarea_repaso_existe(hub_id, nombre, hoy_str):
+        logger.info("Repaso ya existe hoy: %s", tema['tema'])
+        return False
+
+    duracion = _DURACION_REPASO.get(tema["nivel"] or "3", 20)
+    prioridad = "Alta" if urgente else "Media"
+    contexto = f"[{tema['semestre']}] {tema['materia'] or ''} · Dominio {tema['nivel'] or '?'}/5"
+
+    body = {
+        "parent": {"database_id": _to_uuid(hub_id)},
+        "properties": {
+            "Name":             {"title": [{"text": {"content": nombre}}]},
+            "Status":           {"status": {"name": "To Do"}},
+            "Priority":         {"select": {"name": prioridad}},
+            "Category":         {"select": {"name": "🧠 Estudio"}},
+            "Due date":         {"date": {"start": hoy_str}},
+            "📍 Contexto":      {"rich_text": [{"text": {"content": contexto}}]},
+            "⏱️ Duración (min)": {"number": duracion},
+            "✅ Sincronizada":   {"checkbox": False},
+        },
+    }
+    r = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers=_repaso_headers(), json=body, timeout=20,
+    )
+    if r.status_code >= 400:
+        logger.error("Error creando tarea repaso '%s': %s", nombre, _notion_error(r))
+        return False
+    logger.info("Tarea repaso creada: %s [%s]", nombre, prioridad)
+    return True
+
+def ejecutar_modulo_repaso(hub_id: str) -> str:
+    """
+    Punto de entrada del módulo. Devuelve un bloque HTML listo para
+    inyectar en el email. Crea tareas urgentes en el Task Hub.
+    """
+    hoy = datetime.now(get_tz(Config.TIMEZONE)).date()
+    hoy_str = hoy.isoformat()
+    logger.info("=== Módulo Repaso Espaciado · %s ===", hoy_str)
+
+    # Urgentes: 4° semestre con Próximo Repaso <= hoy
+    urgentes_raw = _query_repaso_db({
+        "and": [
+            {"property": "Semestre", "select": {"equals": "4°"}},
+            {"property": "Próximo Repaso", "formula": {"date": {"on_or_before": hoy_str}}},
+        ]
+    })
+
+    # Mantenimiento: semestres anteriores, dominio bajo (1 o 2), vencidos
+    mant_raw = _query_repaso_db({
+        "and": [
+            {"property": "Semestre", "select": {"does_not_equal": "4°"}},
+            {"property": "Próximo Repaso", "formula": {"date": {"on_or_before": hoy_str}}},
+            {"or": [
+                {"property": "Nivel de Dominio", "select": {"equals": "1"}},
+                {"property": "Nivel de Dominio", "select": {"equals": "2"}},
+            ]},
+        ]
+    })
+
+    urgentes   = [_parse_repaso_page(p) for p in urgentes_raw]
+    mantenimiento = [_parse_repaso_page(p) for p in mant_raw]
+
+    logger.info("Urgentes: %d | Mantenimiento: %d", len(urgentes), len(mantenimiento))
+
+    # Crear tareas urgentes en el Task Hub (mantenimiento solo va al email)
+    for t in urgentes:
+        _crear_tarea_repaso(hub_id, t, hoy_str, urgente=True)
+
+    # Construir bloque HTML para el email
+    return _build_repaso_html(urgentes, mantenimiento, hoy_str)
+
+def _build_repaso_html(urgentes: List[dict], mantenimiento: List[dict], hoy_str: str) -> str:
+    if not urgentes and not mantenimiento:
+        return """
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:20px;padding:20px 24px;margin-bottom:18px;">
+          <p style="margin:0;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#16a34a;">🧠 Repaso Espaciado</p>
+          <p style="margin:6px 0 0;font-size:15px;color:#166534;">Sin temas vencidos hoy. ¡Buen trabajo! 🎉</p>
+        </div>"""
+
+    def filas(temas):
+        out = ""
+        for t in temas:
+            nivel = t["nivel"] or "?"
+            bar_color = {"1":"#ef4444","2":"#f97316","3":"#eab308","4":"#22c55e","5":"#3b82f6"}.get(nivel, "#94a3b8")
+            out += f"""
+            <tr>
+              <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{bar_color};margin-right:8px;"></span>
+                <strong style="color:#0f172a;">{t['tema']}</strong>
+              </td>
+              <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;color:#64748b;font-size:13px;">{t['materia'] or '—'}</td>
+              <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;text-align:center;">
+                <span style="background:{bar_color};color:#fff;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;">{nivel}/5</span>
+              </td>
+              <td style="padding:10px 12px;border-bottom:1px solid #f1f5f9;color:#94a3b8;font-size:12px;">{t['semestre'] or ''}</td>
+            </tr>"""
+        return out
+
+    sec_urgentes = ""
+    if urgentes:
+        sec_urgentes = f"""
+        <p style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#dc2626;margin:16px 0 6px;">
+          🔴 Prioritario — 4° Ciclo ({len(urgentes)} tema{'s' if len(urgentes)>1 else ''})
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+          <thead><tr style="background:#fef2f2;">
+            <th style="padding:8px 12px;text-align:left;color:#7f1d1d;font-size:11px;">Tema</th>
+            <th style="padding:8px 12px;text-align:left;color:#7f1d1d;font-size:11px;">Materia</th>
+            <th style="padding:8px 12px;text-align:center;color:#7f1d1d;font-size:11px;">Dominio</th>
+            <th style="padding:8px 12px;color:#7f1d1d;font-size:11px;">Ciclo</th>
+          </tr></thead>
+          <tbody>{filas(urgentes)}</tbody>
+        </table>"""
+
+    sec_mant = ""
+    if mantenimiento:
+        sec_mant = f"""
+        <p style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#d97706;margin:16px 0 6px;">
+          🟡 Mantenimiento — Ciclos anteriores ({len(mantenimiento)} tema{'s' if len(mantenimiento)>1 else ''})
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+          <thead><tr style="background:#fffbeb;">
+            <th style="padding:8px 12px;text-align:left;color:#78350f;font-size:11px;">Tema</th>
+            <th style="padding:8px 12px;text-align:left;color:#78350f;font-size:11px;">Materia</th>
+            <th style="padding:8px 12px;text-align:center;color:#78350f;font-size:11px;">Dominio</th>
+            <th style="padding:8px 12px;color:#78350f;font-size:11px;">Ciclo</th>
+          </tr></thead>
+          <tbody>{filas(mantenimiento)}</tbody>
+        </table>"""
+
+    total = len(urgentes) + len(mantenimiento)
+    return f"""
+    <div style="background:#fff;border:1px solid #cbd5e1;border-radius:24px;padding:22px;
+                box-shadow:0 12px 30px rgba(15,23,42,.05);margin-bottom:18px;">
+      <p style="margin:0 0 4px;font-size:11px;font-weight:700;text-transform:uppercase;
+                letter-spacing:1.2px;color:#64748b;">🧠 Repaso Espaciado · {hoy_str}</p>
+      <p style="margin:0 0 12px;font-size:16px;font-weight:700;color:#0f172a;">
+        {total} tema{'s' if total>1 else ''} para repasar hoy
+        {'· ' + str(len(urgentes)) + ' tarea' + ('s' if len(urgentes)>1 else '') + ' creada' + ('s' if len(urgentes)>1 else '') + ' en Task Hub' if urgentes else ''}
+      </p>
+      {sec_urgentes}
+      {sec_mant}
+    </div>"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FIN MÓDULO REPASO
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
 class CalendarClient:
@@ -130,7 +360,6 @@ class CalendarClient:
         creds = None
         mode  = None
 
-        # ── 1. Service Account (sin expiración, más estable) ─────────────────
         if cfg.GOOGLE_CREDENTIALS_JSON:
             try:
                 creds = Credentials.from_service_account_info(
@@ -141,7 +370,6 @@ class CalendarClient:
                 logger.warning("Service account falló, intentando OAuth: %s", e)
                 creds = None
 
-        # ── 2. OAuth refresh token (fallback; expira cada 7 días en modo Testing) ──
         if creds is None and all([cfg.GOOGLE_OAUTH_CLIENT_ID, cfg.GOOGLE_OAUTH_CLIENT_SECRET,
                                    cfg.GOOGLE_OAUTH_REFRESH_TOKEN, cfg.GOOGLE_OAUTH_TOKEN_URI]):
             try:
@@ -159,7 +387,7 @@ class CalendarClient:
         if creds is None:
             raise RuntimeError(
                 "No se pudo autenticar Google Calendar. "
-                "Verifica GOOGLE_CREDENTIALS_JSON (service account) o regenera GOOGLE_OAUTH_REFRESH_TOKEN."
+                "Verifica GOOGLE_CREDENTIALS_JSON o regenera GOOGLE_OAUTH_REFRESH_TOKEN."
             )
 
         self._svc = build("calendar","v3",credentials=creds)
@@ -176,16 +404,12 @@ class CalendarClient:
 
     def get_write_calendar_id(self) -> str:
         selected = Config.calendar_ids()
-
         if selected != ["ALL"]:
             return selected[0]
-
         avail = self.list_calendars()
-
         if avail:
             return next(iter(avail.keys()))
-
-        raise RuntimeError("La cuenta de Google no tiene calendarios visibles para escritura.")
+        raise RuntimeError("La cuenta de Google no tiene calendarios visibles.")
 
     def get_events(self, cal_ids: List[str], hours:int=48) -> List[Dict]:
         now = datetime.now(timezone.utc)
@@ -287,7 +511,6 @@ class NotionClient:
         return "".join(i.get("plain_text","") for i in items).strip()
 
     def get_pending_tasks(self, db_id:str) -> List[Dict]:
-        """Tareas != Done, ordenadas por Score Urgencia desc."""
         ds_id=self._resolve_ds(db_id)
         payload={"page_size":100,"filter":{"property":"Status","status":{"does_not_equal":"Done"}}}
         pages=[]; cursor=None
@@ -303,7 +526,6 @@ class NotionClient:
             if not data.get("has_more"): break
             cursor=data.get("next_cursor")
 
-        # ── PILAR 1: orden estricto por Score Urgencia desc ──────────────────
         pages.sort(key=lambda t:t["score_urgencia"],reverse=True)
         logger.info("%d tareas pendientes (orden por Score Urgencia):", len(pages))
         for t in pages:
@@ -318,13 +540,11 @@ class NotionClient:
         status  = (props.get("Status",{}).get("status") or {}).get("name","Not started")
         priority= (props.get("Priority",{}).get("select") or {}).get("name","Media")
         category= (props.get("Category",{}).get("select") or {}).get("name","General")
-        due_date= (props.get("Due Date",{}).get("date") or {}).get("start")
+        due_date= (props.get("Due date",{}).get("date") or {}).get("start")
 
-        # ── Contexto: MULTI_SELECT → lista de strings ────────────────────────
         ctx_items = props.get("📍 Contexto",{}).get("multi_select") or []
         contextos: List[str] = [i["name"] for i in ctx_items if i.get("name")]
 
-        # ── Campos de fórmula (solo lectura) ─────────────────────────────────
         dur_prop=props.get("⏱️ Duración (min)",{})
         duracion_min:Optional[int]=None
         if dur_prop.get("type")=="number" and dur_prop.get("number") is not None:
@@ -344,7 +564,6 @@ class NotionClient:
         val_s=self._formula_num(props.get("🎯 Score Urgencia",{}))
         score_urgencia:float=float(val_s) if val_s is not None else 0.0
 
-        # Duración de sesión = duración_total / total_bloques
         if duracion_min and total_bloques and total_bloques>0:
             session_duration=duracion_min//total_bloques
         elif duracion_min:
@@ -363,7 +582,6 @@ class NotionClient:
                 "session_duration":session_duration,"tiempo_a_agendar":tiempo_a_agendar,
                 "score_urgencia":score_urgencia}
 
-    # ── Escritura: solo campos permitidos ─────────────────────────────────────
     def mark_in_progress(self, page_id:str) -> bool:
         uid=_to_uuid(page_id)
         r=self._req("PATCH",f"pages/{uid}",
@@ -409,20 +627,6 @@ def _infer_ctx(s,e,campus)->str:
     return "flexible"
 
 def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
-    """
-    Genera tres tipos de slots:
-      - "Casa"      : tiempo libre antes de la primera clase o después de la última.
-      - "Facultad"  : tiempo libre entre clases (gap <= 240 min).
-      - "Transporte": la hora antes de la primera clase y la hora después de la última.
-                      No se bloquean como tiempo perdido; son slots especiales que
-                      solo aceptan tareas con contexto Transporte.
-      - "flexible"  : días sin clases.
-
-    Los slots de Transporte se agregan TANTO a `occupied` (para que ninguna tarea
-    regular pueda entrar) COMO a `transporte_slots` (para que tareas marcadas con
-    contexto Transporte sí puedan agendarse ahí). Es la única zona del día con esa
-    dualidad — el resto de occupied es tiempo completamente bloqueado.
-    """
     tz=get_tz(tz_name); now=datetime.now(tz); today=now.date()
     day_s=now.replace(hour=Config.WORKDAY_START,minute=0,second=0,microsecond=0)
     day_e=now.replace(hour=Config.WORKDAY_END,  minute=0,second=0,microsecond=0)
@@ -437,18 +641,15 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
     today_ev.sort(key=lambda x:x["start_local"])
     campus=[e for e in today_ev if _is_campus(e)]
 
-    # ── Occupied: eventos reales + almuerzo (NO los buffers de transporte) ───
     occupied=[{"start":e["start_local"],"end":e["end_local"]} for e in today_ev]
     lunch_s=now.replace(hour=Config.LUNCH_START,minute=0,second=0,microsecond=0)
     lunch_e=now.replace(hour=Config.LUNCH_END,  minute=0,second=0,microsecond=0)
     occupied.append({"start":lunch_s,"end":lunch_e})
 
-    # ── Slots de Transporte: 1h pre-primera clase y 1h post-última clase ─────
     transporte_slots:List[Dict]=[]
     if campus:
         first,last=campus[0],campus[-1]
 
-        # Ventana pre-clase (transporte de ida)
         t_pre_s=max(day_s, first["start_local"]-timedelta(hours=1))
         t_pre_e=first["start_local"]
         dur_pre=int((t_pre_e-t_pre_s).total_seconds()/60)
@@ -458,10 +659,8 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
                 "label":f"{t_pre_s.strftime('%H:%M')} - {t_pre_e.strftime('%H:%M')} [Transporte]",
                 "context":"Transporte",
             })
-            # Sí va a occupied: ninguna tarea no-transporte puede entrar aquí
             occupied.append({"start":t_pre_s,"end":t_pre_e})
 
-        # Ventana post-clase (transporte de vuelta)
         t_post_s=last["end_local"]
         t_post_e=min(day_e, last["end_local"]+timedelta(hours=1))
         dur_post=int((t_post_e-t_post_s).total_seconds()/60)
@@ -473,7 +672,6 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
             })
             occupied.append({"start":t_post_s,"end":t_post_e})
 
-    # ── Slots regulares (Casa / Facultad / flexible) ──────────────────────────
     merged=_merge([iv for iv in occupied if iv["end"]>day_s and iv["start"]<day_e])
     regular_slots:List[Dict]=[]; cursor=day_s
     for iv in merged:
@@ -497,7 +695,6 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
                 "context":ctx,
             })
 
-    # ── Orden cronológico: primero regulares + transporte mezclados por hora ──
     all_slots=sorted(regular_slots+transporte_slots, key=lambda x:x["start"])
 
     logger.info("Slots generados:")
@@ -507,15 +704,6 @@ def find_free_slots(events:List[Dict], tz_name:str) -> List[Dict]:
 
 
 def _ctx_ok(task_contextos:List[str], slot_ctx:str) -> bool:
-    """
-    Compatibilidad contexto tarea ↔ contexto slot.
-
-    Slot "Transporte" → SOLO tareas que incluyan "Transporte".
-    Slot "Casa"       → tareas con "Casa", sin contexto, o "Facultad" en flexible.
-    Slot "Facultad"   → tareas con "Facultad" o sin contexto.
-    Slot "flexible"   → cualquier tarea EXCEPTO las que solo tienen "Transporte".
-    Tarea sin contexto → cualquier slot EXCEPTO "Transporte".
-    """
     slot_norm = slot_ctx.lower()
     task_norms = [tc.lower() for tc in task_contextos]
     tiene_transporte = any("transporte" in tc for tc in task_norms)
@@ -524,48 +712,19 @@ def _ctx_ok(task_contextos:List[str], slot_ctx:str) -> bool:
     sin_contexto     = not task_contextos
 
     if slot_norm == "transporte":
-        return tiene_transporte  # SOLO tareas de transporte
-
-    # A partir de aquí: slots que NO son Transporte → tareas de transporte nunca entran
-    # a menos que también tengan otro contexto compatible.
+        return tiene_transporte
     if sin_contexto:
-        return True  # tarea sin contexto acepta Casa, Facultad y flexible
-
+        return True
     if slot_norm == "casa":
-        return tiene_casa  # solo tareas con Casa (o flexible via sin_contexto, ya cubierto)
-
+        return tiene_casa
     if slot_norm == "facultad":
-        return tiene_facultad  # solo tareas con Facultad (o sin contexto, ya cubierto)
-
+        return tiene_facultad
     if slot_norm == "flexible":
-        return tiene_casa or tiene_facultad  # transporte-only quedaría fuera
-
-    return True  # fallback para contextos desconocidos
+        return tiene_casa or tiene_facultad
+    return True
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 class Scheduler:
-    """
-    Lógica de asignación con respeto estricto a bloques y prioridad:
-
-    FASE 1 — Recorrido en orden de Score Urgencia (desc):
-      Para cada tarea se busca si cabe AL MENOS UN BLOQUE (session_duration)
-      en algún slot compatible. Si cabe → se agenda y los slots se actualizan.
-      Si NO cabe en ningún slot → la tarea va al pool de 'pendientes_segunda'.
-
-    FASE 2 — Segunda pasada con los slots que sobraron:
-      Las tareas pendientes vuelven a intentarse en los huecos residuales.
-      Esto cubre el caso: tarea A (100 min/bloque) no cabe en hueco de 60 min,
-      tarea B (60 min/bloque) ocupa ese hueco, y el hueco de 120 min queda
-      libre para que tarea A entre en la segunda pasada.
-
-    Reglas adicionales:
-      - Buffer 15 min obligatorio entre bloques (PILAR buffer).
-      - Límite 6h neto total (PILAR límite).
-      - Sin micro-bloques: session_duration < MIN_SESSION → tarea omitida.
-      - Si una tarea tiene más bloques de los que caben hoy, se agendan
-        los que caben y el resto queda para mañana (no va a unscheduled).
-    """
-
     def assign(self, tasks:List[Dict], free_slots:List[Dict]) -> Tuple[List[Dict],List[Dict]]:
         slots=[{"start":s["start"],"end":s["end"],"duration_min":s["duration_min"],
                 "label":s["label"],"context":s["context"]} for s in free_slots]
@@ -576,7 +735,6 @@ class Scheduler:
         max_study_min=Config.MAX_STUDY_HOURS*60
         cursor_ultimo:Optional[datetime]=None
 
-        # ── FASE 1: pasada principal en orden de prioridad ───────────────────
         pendientes_segunda:List[Dict]=[]
         for task in tasks:
             if total_study_min>=max_study_min:
@@ -588,16 +746,11 @@ class Scheduler:
                 scheduled.extend(sessions)
                 total_study_min+=sum(s["duration_min"] for s in sessions)
                 cursor_ultimo=sessions[-1]["end"]
-                logger.info("  Agendada [fase1]: %s → %d sesiones",
-                            task["title"],len(sessions))
+                logger.info("  Agendada [fase1]: %s → %d sesiones",task["title"],len(sessions))
             else:
-                # No entró en ningún slot en esta pasada; puede que haya
-                # huecos residuales después de agendar tareas de menor score.
                 pendientes_segunda.append(task)
-                logger.info("  Pendiente [fase2]: %s (sesion=%smin)",
-                            task["title"],task.get("session_duration"))
+                logger.info("  Pendiente [fase2]: %s (sesion=%smin)",task["title"],task.get("session_duration"))
 
-        # ── FASE 2: segunda pasada con huecos residuales ─────────────────────
         for task in pendientes_segunda:
             if total_study_min>=max_study_min:
                 unscheduled.append(task); continue
@@ -607,8 +760,7 @@ class Scheduler:
                 scheduled.extend(sessions)
                 total_study_min+=sum(s["duration_min"] for s in sessions)
                 cursor_ultimo=sessions[-1]["end"]
-                logger.info("  Agendada [fase2]: %s → %d sesiones",
-                            task["title"],len(sessions))
+                logger.info("  Agendada [fase2]: %s → %d sesiones",task["title"],len(sessions))
             else:
                 unscheduled.append(task)
                 logger.info("  Sin hueco: %s",task["title"])
@@ -617,11 +769,6 @@ class Scheduler:
 
     def _fit(self, task:Dict, slots:List[Dict],
              cursor_ultimo:Optional[datetime], presupuesto:int) -> List[Dict]:
-        """
-        Intenta colocar tantos bloques de session_duration como quepan hoy.
-        Modifica `slots` in-place para reflejar la capacidad consumida.
-        Retorna lista de sesiones (vacía si no pudo agendar ni una).
-        """
         session_dur=task.get("session_duration")
         if not session_dur:
             return []
@@ -639,34 +786,29 @@ class Scheduler:
             if not _ctx_ok(task.get("contextos",[]),slot["context"]):
                 continue
 
-            # ── Buffer desde el último bloque ────────────────────────────────
             slot_start=slot["start"]
             if cursor_ultimo is not None:
                 earliest=cursor_ultimo+timedelta(minutes=Config.BUFFER_MINUTES)
                 if earliest>=slot["end"]:
-                    continue  # slot completamente dentro del buffer
+                    continue
                 if earliest>slot_start:
-                    slot_start=earliest  # recortar inicio
+                    slot_start=earliest
 
             slot_avail=int((slot["end"]-slot_start).total_seconds()/60)
 
-            # ── Verificación clave: ¿cabe al menos UN bloque completo? ───────
             if slot_avail<session_dur:
-                continue  # este slot no es suficiente; lo dejamos para otra tarea
+                continue
 
-            # Cuántos bloques caben (considerando buffer entre bloques del mismo slot)
-            # Cada bloque ocupa session_dur + BUFFER, excepto el último que no necesita buffer
-            # Formula: n bloques caben si session_dur*n + BUFFER*(n-1) <= slot_avail
-            # → n <= (slot_avail + BUFFER) / (session_dur + BUFFER)
             import math
             n_caben=math.floor((slot_avail+Config.BUFFER_MINUTES)/
                                (session_dur+Config.BUFFER_MINUTES))
-            n_caben=max(n_caben,1)  # al menos 1 si pasó el check anterior
+            n_caben=max(n_caben,1)
             n_necesarias=math.ceil(tiempo_restante/session_dur)
             n_usar=min(n_caben,n_necesarias)
 
             cursor=slot_start
             bloques_en_slot=0
+            sess_end=None
             for i in range(n_usar):
                 if tiempo_restante<=0:
                     break
@@ -686,26 +828,24 @@ class Scheduler:
                 })
                 bloques_en_slot+=1
                 tiempo_restante-=dur
-                # Buffer entre bloques dentro del mismo slot (excepto tras el último)
                 cursor=sess_end
                 if i<n_usar-1 and tiempo_restante>0:
                     cursor=cursor+timedelta(minutes=Config.BUFFER_MINUTES)
 
-            # Actualizar slot: avanzar su inicio al cursor actual
-            if bloques_en_slot>0:
+            if bloques_en_slot>0 and sess_end:
                 slot["start"]=cursor
                 slot["duration_min"]=max(0,int((slot["end"]-cursor).total_seconds()/60))
-                # Actualizar cursor_ultimo para el siguiente bloque de cualquier tarea
-                cursor_ultimo=sess_end  # noqa: F821 — siempre definido si bloques_en_slot>0
+                cursor_ultimo=sess_end
 
         return sessions
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 class EmailBuilder:
     @staticmethod
-    def build(scheduled:List[Dict],unscheduled:List[Dict],
-              all_events:List[Dict],timestamp:datetime,
-              tz_name:str,hub_url:str)->str:
+    def build(scheduled:List[Dict], unscheduled:List[Dict],
+              all_events:List[Dict], timestamp:datetime,
+              tz_name:str, hub_url:str,
+              repaso_html:str="") -> str:          # ← nuevo parámetro
         tz=get_tz(tz_name)
         local_ts=timestamp.astimezone(tz).strftime("%d/%m/%Y %H:%M")
         today=datetime.now(tz).date(); tomorrow=today+timedelta(days=1)
@@ -784,6 +924,7 @@ th{{background:#f8fafc;text-align:left;padding:10px 12px;color:#334155;border-bo
       <td style="width:33%;padding-left:8px;vertical-align:top;"><div class="mc"><div class="mv">{len(unscheduled)}</div><div class="ml">Sin hueco hoy</div></div></td>
     </tr></table>
   </div>
+  {repaso_html}
   <div class="panel"><p class="sec">Sesiones del dia</p>
     <table role="presentation">{cards if cards else '<tr><td><div style="padding:20px;color:#64748b;text-align:center;">Sin sesiones.</div></td></tr>'}</table>
   </div>
@@ -831,23 +972,34 @@ class Asistente:
         cal=CalendarClient()
         events=cal.get_events(Config.calendar_ids(),hours=48)
 
-        # 2. Tareas (ordenadas por Score Urgencia)
+        # 2. Módulo Repaso Espaciado
+        #    Crea tareas urgentes en el Task Hub ANTES de leer las tareas,
+        #    para que el scheduler las vea y las incluya en el plan del día.
+        repaso_html = ""
+        try:
+            repaso_html = ejecutar_modulo_repaso(Config.NOTION_DATABASE_ID)
+            logger.info("Módulo Repaso OK")
+        except Exception as e:
+            logger.error("Módulo Repaso falló (no crítico): %s", e)
+            repaso_html = ""
+
+        # 3. Tareas Task Hub (ya incluye las de repaso recién creadas)
         notion=NotionClient()
         tasks=notion.get_pending_tasks(Config.NOTION_DATABASE_ID)
 
-        # 3. Huecos
+        # 4. Huecos
         free_slots=find_free_slots(events,Config.TIMEZONE)
         logger.info("%d huecos libres:",len(free_slots))
         for sl in free_slots:
             logger.info("  %s (%dmin) [%s]",sl["label"],sl["duration_min"],sl["context"])
 
-        # 4. Asignación
+        # 5. Asignación
         scheduler=Scheduler()
         scheduled,unscheduled=scheduler.assign(tasks,free_slots)
         logger.info("%d sesiones / %d sin hueco",len(scheduled),len(unscheduled))
 
-        # 5. Crear eventos Google Calendar
-        agendadas:Dict[str,int]={}  # task_id → último bloque
+        # 6. Crear eventos Google Calendar
+        agendadas:Dict[str,int]={}
         for sess in scheduled:
             bl=f" ({sess['bloque_numero']}/{sess['total_bloques']})" if sess["total_bloques"] else ""
             title=f"[Asistente] {sess['task_title']}{bl}"
@@ -862,15 +1014,16 @@ class Asistente:
                 agendadas[sess["task_id"]]=max(prev,sess["bloques_completados_finales"])
         logger.info("%d eventos creados",len(agendadas))
 
-        # 6. Sincronizar Notion
+        # 7. Sincronizar Notion
         for task_id,bloque_final in agendadas.items():
             notion.mark_in_progress(task_id)
             notion.update_bloques(task_id,bloque_final)
 
-        # 7. Email
+        # 8. Email (con bloque de repaso inyectado)
         now=datetime.now(timezone.utc)
         html=EmailBuilder.build(scheduled,unscheduled,events,now,
-                                Config.TIMEZONE,Config.TASK_HUB_URL)
+                                Config.TIMEZONE,Config.TASK_HUB_URL,
+                                repaso_html=repaso_html)
         subj=(f"Asistente · {now.astimezone(get_tz(Config.TIMEZONE)).strftime('%d/%m/%Y')} · "
               f"{len(agendadas)} tareas")
         if not EmailSender.send(subj,html): return 1
