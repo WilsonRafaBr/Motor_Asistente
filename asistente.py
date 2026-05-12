@@ -132,9 +132,26 @@ def _repaso_headers() -> dict:
         "Content-Type": "application/json",
     }
 
-def _query_repaso_db(filtro: dict) -> List[dict]:
-    """Pagina completa sobre la BD Maestra con el filtro dado."""
+def _resolve_repaso_ds() -> str:
+    """Resuelve el data source ID de la BD Maestra de Estudio."""
     db_id = _to_uuid(Config.REPASO_DB_ID)
+    h = _repaso_headers()
+    r = requests.get(f"https://api.notion.com/v1/databases/{db_id}", headers=h, timeout=20)
+    if r.status_code == 200:
+        sources = r.json().get("data_sources", [])
+        if sources:
+            ds = sources[0]["id"]
+            logger.info("Repaso DS resuelto: %s", ds)
+            return ds
+        return db_id
+    # fallback: intentar como data_source directo
+    r2 = requests.get(f"https://api.notion.com/v1/data_sources/{db_id}", headers=h, timeout=20)
+    if r2.status_code == 200:
+        return db_id
+    raise RuntimeError(f"No se pudo resolver BD Repaso: {_notion_error(r)}")
+
+def _query_repaso_db(filtro: dict, ds_id: str) -> List[dict]:
+    """Pagina completa sobre la BD Maestra con el filtro dado."""
     results = []
     cursor = None
     while True:
@@ -142,7 +159,7 @@ def _query_repaso_db(filtro: dict) -> List[dict]:
         if cursor:
             body["start_cursor"] = cursor
         r = requests.post(
-            f"https://api.notion.com/v1/databases/{db_id}/query",
+            f"https://api.notion.com/v1/data_sources/{ds_id}/query",
             headers=_repaso_headers(), json=body, timeout=20,
         )
         if r.status_code >= 400:
@@ -189,7 +206,7 @@ def _tarea_repaso_existe(hub_id: str, nombre: str, hoy_str: str) -> bool:
             "filter": {
                 "and": [
                     {"property": "Name", "title": {"equals": nombre}},
-                    {"property": "Due date", "date": {"equals": hoy_str}},
+                    {"property": "Due Date", "date": {"equals": hoy_str}},
                 ]
             },
             "page_size": 1,
@@ -217,8 +234,8 @@ def _crear_tarea_repaso(hub_id: str, tema: dict, hoy_str: str, urgente: bool) ->
             "Status":           {"status": {"name": "To Do"}},
             "Priority":         {"select": {"name": prioridad}},
             "Category":         {"select": {"name": "🧠 Estudio"}},
-            "Due date":         {"date": {"start": hoy_str}},
-            "📍 Contexto":      {"rich_text": [{"text": {"content": contexto}}]},
+            "Due Date":         {"date": {"start": hoy_str}},
+            "📍 Contexto":      {"multi_select": [{"name": "Casa"}]},
             "⏱️ Duración (min)": {"number": duracion},
             "✅ Sincronizada":   {"checkbox": False},
         },
@@ -242,13 +259,15 @@ def ejecutar_modulo_repaso(hub_id: str) -> str:
     hoy_str = hoy.isoformat()
     logger.info("=== Módulo Repaso Espaciado · %s ===", hoy_str)
 
+    ds_id = _resolve_repaso_ds()
+
     # Urgentes: 4° semestre con Próximo Repaso <= hoy
     urgentes_raw = _query_repaso_db({
         "and": [
             {"property": "Semestre", "select": {"equals": "4°"}},
             {"property": "Próximo Repaso", "formula": {"date": {"on_or_before": hoy_str}}},
         ]
-    })
+    }, ds_id)
 
     # Mantenimiento: semestres anteriores, dominio bajo (1 o 2), vencidos
     mant_raw = _query_repaso_db({
@@ -260,7 +279,7 @@ def ejecutar_modulo_repaso(hub_id: str) -> str:
                 {"property": "Nivel de Dominio", "select": {"equals": "2"}},
             ]},
         ]
-    })
+    }, ds_id)
 
     urgentes   = [_parse_repaso_page(p) for p in urgentes_raw]
     mantenimiento = [_parse_repaso_page(p) for p in mant_raw]
@@ -580,7 +599,8 @@ class NotionClient:
                 "duracion_min":duracion_min,"minutos_restantes":minutos_restantes,
                 "total_bloques":total_bloques,"bloques_completados":bloques_completados,
                 "session_duration":session_duration,"tiempo_a_agendar":tiempo_a_agendar,
-                "score_urgencia":score_urgencia}
+                "score_urgencia":score_urgencia,
+                "es_repaso": title.startswith("📖 Repasar:")}
 
     def mark_in_progress(self, page_id:str) -> bool:
         uid=_to_uuid(page_id)
@@ -772,7 +792,8 @@ class Scheduler:
         session_dur=task.get("session_duration")
         if not session_dur:
             return []
-        if session_dur<Config.MIN_SESSION:
+        es_repaso=task.get("es_repaso", False)
+        if not es_repaso and session_dur<Config.MIN_SESSION:
             logger.info("Micro-bloque omitido (%dmin): %s",session_dur,task["title"])
             return []
 
@@ -813,7 +834,7 @@ class Scheduler:
                 if tiempo_restante<=0:
                     break
                 dur=min(session_dur,tiempo_restante)
-                if dur<Config.MIN_SESSION:
+                if not es_repaso and dur<Config.MIN_SESSION:
                     break
                 sess_end=cursor+timedelta(minutes=dur)
                 bloque_num+=1
